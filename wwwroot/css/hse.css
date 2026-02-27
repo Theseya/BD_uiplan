@@ -1,0 +1,25 @@
+:root {
+    --hse-blue: #0f2d69;
+    --hse-blue-2: #234b9b;
+    --text: #111;
+    --muted: #667085;
+    --bg: #f6f7fb;
+    --card: #fff;
+    --border: #e6e6e6;
+}
+
+* {
+    box-sizing: border-box
+}
+
+html, body {
+    height: 100%
+}
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui,-apple-system,"Segoe UI",Arial,sans-serif;
+    line-height: 1.35;
+}

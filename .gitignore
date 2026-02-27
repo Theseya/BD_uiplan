@@ -1,0 +1,49 @@
+# Build
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+*.dll
+*.exe
+*.pdb
+*.user
+*.suo
+*.cache
+*.log
+.vs/
+*.csproj.user
+
+# NuGet
+packages/
+*.nupkg
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# ASP.NET
+*.dbmdl
+*.jfm
+*.pfx
+*.publishsettings
+
+# User-specific
+*.rsuser
+*.userosscache
+*.sln.docstates
+
+# JetBrains Rider
+.idea/
+*.sln.iml
+
+# Test results
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+*.VisualState.xml
+TestResult.xml
+coverage*.json
+coverage*.xml
+*.coverage
+
+# Node (if any)
+node_modules/
+npm-debug.log
