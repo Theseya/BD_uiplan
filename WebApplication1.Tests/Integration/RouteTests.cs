@@ -4,6 +4,7 @@ using Xunit;
 
 namespace WebApplication1.Tests.Integration;
 
+[Collection(nameof(WebAppCollection))]
 public class RouteTests : IClassFixture<WebAppFactory>
 {
     private readonly HttpClient _client;

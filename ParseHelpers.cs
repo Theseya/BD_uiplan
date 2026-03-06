@@ -35,19 +35,15 @@ public static class ParseHelpers
         bool prevSpace = false;
         foreach (var ch in s.ToLowerInvariant())
         {
-            var c = ch;
-            if (char.IsLetterOrDigit(c))
+            if (char.IsLetterOrDigit(ch))
             {
-                sb.Append(c);
+                sb.Append(ch);
                 prevSpace = false;
             }
-            else
+            else if (!prevSpace)
             {
-                if (!prevSpace)
-                {
-                    sb.Append(' ');
-                    prevSpace = true;
-                }
+                sb.Append(' ');
+                prevSpace = true;
             }
         }
         return sb.ToString().Trim();

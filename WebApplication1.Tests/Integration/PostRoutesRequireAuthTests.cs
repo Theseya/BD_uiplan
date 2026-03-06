@@ -8,6 +8,7 @@ namespace WebApplication1.Tests.Integration;
 /// <summary>
 /// POST endpoints that require auth must redirect to login when not authenticated.
 /// </summary>
+[Collection(nameof(WebAppCollection))]
 public class PostRoutesRequireAuthTests : IClassFixture<WebAppFactory>
 {
     private readonly HttpClient _client;

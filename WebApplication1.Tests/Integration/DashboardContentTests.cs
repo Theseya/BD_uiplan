@@ -7,6 +7,7 @@ namespace WebApplication1.Tests.Integration;
 /// <summary>
 /// Dashboard (/) content when authenticated: sections and stat labels added for main page.
 /// </summary>
+[Collection(nameof(WebAppCollection))]
 public class DashboardContentTests : IClassFixture<WebAppFactory>
 {
     private readonly WebApplicationFactory<Program> _factory;

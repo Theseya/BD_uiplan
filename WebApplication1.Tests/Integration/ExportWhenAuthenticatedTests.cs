@@ -9,6 +9,7 @@ namespace WebApplication1.Tests.Integration;
 /// Регрессионные тесты выгрузки в Excel: при авторизации export возвращает файл (200) или редирект,
 /// чтобы исправления выгрузки не терялись при правках кода.
 /// </summary>
+[Collection(nameof(WebAppCollection))]
 public class ExportWhenAuthenticatedTests : IClassFixture<WebAppFactory>
 {
     private readonly WebAppFactory _factory;

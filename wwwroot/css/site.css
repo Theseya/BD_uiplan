@@ -6,6 +6,7 @@ body {
 
 .container {
     max-width: 100%;
+    min-width: 0;
     margin: 0 auto;
     padding: 18px 28px 40px
 }
@@ -296,13 +297,15 @@ a.brand--link:hover {
     background: #fff;
     border: 1px solid var(--border);
     border-radius: 12px;
-    padding: 14px;
-    margin: 12px 0;
-    box-shadow: 0 6px 16px rgba(13, 25, 64, 0.06)
+    padding: 16px 18px;
+    margin: 14px 0;
+    box-shadow: 0 6px 16px rgba(13, 25, 64, 0.06);
+    min-width: 0;
 }
 
 .card--flush {
-    padding: 0
+    padding: 0;
+    min-width: 0;
 }
 
 .hint {
@@ -568,6 +571,9 @@ a.brand--link:hover {
     margin-left: 0.5rem;
     cursor: pointer;
 }
+.toolbar-import .btn--file {
+    margin-left: 0;
+}
 .btn--file input[type="file"] {
     position: absolute;
     left: 0;
@@ -597,13 +603,13 @@ button.link {
     cursor: pointer
 }
 
-/* Кнопка выгрузки в Excel — заметная, с рамкой и толщиной */
+/* Кнопка выгрузки в Excel — единый вид на всех вкладках */
+.btn--excel,
 a[data-export="excel"] {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     gap: 8px;
-    min-width: 44px;
     min-height: 44px;
     padding: 10px 16px;
     border: 2px solid #217346;
@@ -613,7 +619,10 @@ a[data-export="excel"] {
     font-weight: 600;
     text-decoration: none;
     box-shadow: 0 2px 6px rgba(33, 115, 70, 0.35);
+    cursor: pointer;
+    font-size: 15px;
 }
+.btn--excel:hover,
 a[data-export="excel"]:hover {
     background: #1a5c38;
     border-color: #1a5c38;
@@ -621,8 +630,23 @@ a[data-export="excel"]:hover {
     text-decoration: none;
     box-shadow: 0 3px 10px rgba(33, 115, 70, 0.4);
 }
+.btn--excel svg,
 a[data-export="excel"] svg {
     flex-shrink: 0;
+}
+
+/* Блок загрузки из Excel — единые отступы на всех вкладках */
+.toolbar-import {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.toolbar-import form {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
 }
 
 /* Контейнер: сверху — горизонтальная полоса прокрутки, снизу — таблица */
@@ -678,15 +702,19 @@ a[data-export="excel"] svg {
 }
 
 .table-wrap {
-    overflow: auto;
+    overflow-x: auto;
+    overflow-y: visible;
     border-radius: 14px;
+    -webkit-overflow-scrolling: touch;
 }
 
+/* По умолчанию таблица на всю ширину — нет пустого места на полном экране */
 .table {
     width: 100%;
     border-collapse: separate;
     border-spacing: 0;
-    box-sizing: border-box
+    box-sizing: border-box;
+    table-layout: auto;
 }
 
     .table th, .table td {
@@ -694,11 +722,24 @@ a[data-export="excel"] svg {
         border-bottom: 1px solid var(--border);
         vertical-align: top;
         white-space: normal;
-        font-size: 16px
+        font-size: 16px;
+        box-sizing: border-box;
     }
 
     .table td {
-        min-width: 100px
+        min-width: 60px;
+    }
+
+    /* Колонка «Год» — чтобы полностью был виден год (2024-2025) */
+    .table th.col-year,
+    .table td.col-year {
+        min-width: 120px;
+    }
+
+    .table td .input,
+    .table td select.input {
+        max-width: 100%;
+        min-width: 0;
     }
 
 /* Единый стиль полей во всех таблицах (Нагрузка, ППС, Дисциплины и др.) */
@@ -839,6 +880,12 @@ a[data-export="excel"] svg {
     color: #4a5568
 }
 
+.input--multiselect {
+    min-width: 7.5em;
+    padding: 2px 4px;
+    font-size: 0.9em
+}
+
 .op-checkboxes {
     display: flex;
     flex-direction: column;
@@ -904,9 +951,18 @@ a[data-export="excel"] svg {
 
 .toolbar {
     display: flex;
-    gap: 10px;
+    gap: 12px;
     align-items: center;
-    flex-wrap: wrap
+    flex-wrap: wrap;
+    row-gap: 10px;
+}
+.toolbar .hint {
+    margin-top: 0;
+    margin-bottom: 0;
+}
+.toolbar + .hint {
+    margin-top: 6px;
+    margin-bottom: 0;
 }
 
 .modal::backdrop {
@@ -923,9 +979,10 @@ a[data-export="excel"] svg {
 
 .modal__actions {
     display: flex;
-    gap: 10px;
+    gap: 12px;
     justify-content: flex-end;
-    margin-top: 12px
+    margin-top: 16px;
+    padding-top: 4px;
 }
 
     .table th {
@@ -965,20 +1022,17 @@ a[data-export="excel"] svg {
     margin: 6px 0
 }
 
-/* Таблицы: при ширине экрана до 1400px — не сжимать, показывать горизонтальный скролл (чтобы в пол-экрана ячейки не налезали) */
-@media (max-width: 1400px) {
-    .table-scroll-top .table-wrap {
-        overflow-x: auto !important;
-    }
+/* Узкий экран: таблица не сжимается, появляется горизонтальный скролл (ячейки не налезают) */
+@media (max-width: 1200px) {
+    .table-scroll-top .table-wrap,
     .table-wrap {
-        overflow-x: auto;
+        overflow-x: auto !important;
         -webkit-overflow-scrolling: touch;
     }
     .table-scroll-top .table-wrap .table,
     .table-wrap .table {
-        min-width: 1400px;
         width: max-content;
-        table-layout: auto;
+        min-width: 1200px;
     }
     #wl-table { min-width: 1500px }
     #pps-table { min-width: 1200px }

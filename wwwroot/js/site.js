@@ -145,7 +145,6 @@ document.addEventListener("mousedown", (event) => {
     <td></td>
     <td>
       <input class="input" name="facultyName_${rowKey}" list="wl-faculty-list" value="" placeholder="Преподаватель">
-      <input class="input" name="role_${rowKey}" value="" placeholder="Роль">
     </td>
   `;
   tbody.prepend(row);
@@ -170,6 +169,52 @@ document.addEventListener("mousedown", (event) => {
     <input class="input" name="hours_${nextIndex}_${rowKey}" value="" placeholder="Часы">
   `;
   list.appendChild(div);
+});
+
+// Нераспределённая нагрузка по дисциплине = план − совокупная распределённая. Пересчёт при изменении часов.
+function recalcUnallocatedWorkload(ev) {
+  var target = ev && ev.target;
+  if (!target || !target.name || target.name.indexOf("hours_") !== 0) return;
+  var table = document.getElementById("wl-table");
+  if (!table) return;
+  var row = target.closest("tr");
+  if (!row || !row.getAttribute("data-plan-discipline-id")) return;
+  var pdId = row.getAttribute("data-plan-discipline-id");
+  var planTotal = parseFloat(row.getAttribute("data-plan-total")) || 0;
+  var initialAllocated = parseFloat(row.getAttribute("data-initial-allocated")) || 0;
+  var effectivePlan = planTotal > 0 ? planTotal : initialAllocated;
+  var allRows = table.querySelectorAll("tr[data-plan-discipline-id=\"" + pdId + "\"]");
+  var totalAllocated = 0;
+  for (var i = 0; i < allRows.length; i++) {
+    var inputs = allRows[i].querySelectorAll("input[name^=\"hours_\"]");
+    for (var j = 0; j < inputs.length; j++) totalAllocated += parseFloat(inputs[j].value) || 0;
+  }
+  var unallocated = Math.max(0, effectivePlan - totalAllocated);
+  var val = (Math.round(unallocated * 100) / 100).toString();
+  for (var k = 0; k < allRows.length; k++) {
+    var r = allRows[k];
+    var cell = r.querySelector("td.cell-unallocated") || (r.cells && r.cells.length > 10 ? r.cells[10] : null);
+    if (cell) cell.textContent = val;
+  }
+}
+function attachWorkloadRecalc() {
+  var table = document.getElementById("wl-table");
+  if (!table) return;
+  table.addEventListener("input", recalcUnallocatedWorkload);
+  table.addEventListener("change", recalcUnallocatedWorkload);
+  table.addEventListener("keyup", recalcUnallocatedWorkload);
+  var inputs = table.querySelectorAll("input[name^=\"hours_\"]");
+  for (var i = 0; i < inputs.length; i++) inputs[i].dispatchEvent(new Event("input", { bubbles: true }));
+}
+document.addEventListener("DOMContentLoaded", attachWorkloadRecalc);
+document.addEventListener("input", function(ev) {
+  if (ev.target && ev.target.name && ev.target.name.indexOf("hours_") === 0) recalcUnallocatedWorkload(ev);
+});
+document.addEventListener("change", function(ev) {
+  if (ev.target && ev.target.name && ev.target.name.indexOf("hours_") === 0) recalcUnallocatedWorkload(ev);
+});
+document.addEventListener("keyup", function(ev) {
+  if (ev.target && ev.target.name && ev.target.name.indexOf("hours_") === 0) recalcUnallocatedWorkload(ev);
 });
 
 document.addEventListener("mousedown", (event) => {

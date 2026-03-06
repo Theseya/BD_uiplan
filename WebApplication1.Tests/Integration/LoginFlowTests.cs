@@ -4,6 +4,7 @@ using Xunit;
 
 namespace WebApplication1.Tests.Integration;
 
+[Collection(nameof(WebAppCollection))]
 public class LoginFlowTests : IClassFixture<WebAppFactory>
 {
     private readonly WebApplicationFactory<Program> _factory;
