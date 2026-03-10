@@ -815,6 +815,20 @@ static string OptionsListStrings(IEnumerable<string> opts, string? sel, string e
     return sb.ToString();
 }
 
+/// <summary>Опции модуля в нагрузке: только 1, 2, 3, 4 (с подписью «модуль»). Без прочерка — по умолчанию 1.</summary>
+static string WorkloadModuleSelect(int? selectedModNo)
+{
+    var effective = selectedModNo is >= 1 and <= 4 ? selectedModNo.Value : 1;
+    var sb = new StringBuilder();
+    for (var i = 1; i <= 4; i++)
+    {
+        sb.Append("<option value=\"").Append(i).Append("\"");
+        if (effective == i) sb.Append(" selected");
+        sb.Append(">").Append(i).Append(" модуль</option>");
+    }
+    return sb.ToString();
+}
+
 // ==================== Routes ====================
 app.MapGet("/login", (HttpContext ctx, IWebHostEnvironment env, string? returnUrl, string? error, string? first, string? reset) =>
 {
@@ -1469,6 +1483,7 @@ LIMIT 500;
     var allOps = OpMagistracy.Concat(OpBachelor).Distinct().OrderBy(x => x).ToArray();
     var allDepartmentNames = departments.Select(d => d.name).OrderBy(x => x).ToArray();
     sb.Append("<select id='wl-year-options' class='input' style='display:none'>").Append(SelectOptions.AcademicYearOptions(null)).Append("</select>");
+    sb.Append("<select id='wl-module-options' class='input' style='display:none'>").Append(WorkloadModuleSelect(null)).Append("</select>");
     sb.Append("<select id='wl-op-options' class='input' style='display:none'>").Append(OptionsListStrings(allOps, null, "ОП")).Append("</select>");
     sb.Append("<select id='wl-level-options' class='input' style='display:none'>").Append(OptionsListStrings(SelectOptions.EducationLevels, null, "Уровень")).Append("</select>");
     sb.Append("<select id='wl-dept-options' class='input' style='display:none'>").Append(OptionsListStrings(allDepartmentNames, null, "Департамент")).Append("</select>");
@@ -1552,7 +1567,7 @@ WHERE pd.plan_discipline_id = ANY(@ids)", conn);
     {
         var first = grp.First();
         var rowKey = first.assignmentId.ToString();
-        var modVal = $"{(first.modNo is null ? "" : first.modNo.ToString())} {first.modName}".Trim();
+        var moduleSelected = first.modNo is >= 1 and <= 4 ? first.modNo : (int?)null;
         var workTypeHoursList = grp.Select(x => (x.workTypeId, x.hours)).ToList();
 
         var planTotalForRow = planTotalByPlanId.TryGetValue(first.planDisciplineId, out var pt) ? pt : 0m;
@@ -1565,8 +1580,8 @@ WHERE pd.plan_discipline_id = ANY(@ids)", conn);
             sb.Append("<td><input type='checkbox' class='row-select row-select-wl' disabled></td>");
         if (canEditWl)
             sb.Append("<td class=\"col-year\"><select class=\"input\" name=\"year_").Append(rowKey).Append("\">").Append(SelectOptions.AcademicYearOptions(first.year)).Append("</select></td>")
-              .Append("<td><input class=\"input\" name=\"module_").Append(rowKey).Append("\" value=\"").Append(ParseHelpers.H(modVal)).Append("\"></td>")
-              .Append("<td><input class=\"input\" name=\"disciplineNo_").Append(rowKey).Append("\" value=\"").Append(ParseHelpers.H(first.discNo)).Append("\"></td>")
+              .Append("<td><select class=\"input\" name=\"module_").Append(rowKey).Append("\">").Append(WorkloadModuleSelect(moduleSelected)).Append("</select></td>")
+              .Append("<td><input class=\"input\" name=\"disciplineNo_").Append(rowKey).Append("\" value=\"").Append(ParseHelpers.H(first.discNo)).Append("\" pattern=\"[0-9]*\" title=\"Только цифры\"></td>")
               .Append("<td><input class=\"input\" name=\"disciplineName_").Append(rowKey).Append("\" value=\"").Append(ParseHelpers.H(first.discName)).Append("\"></td>")
               .Append("<td><select class=\"input\" name=\"opName_").Append(rowKey).Append("\">").Append(OptionsListStrings(allOps, first.opName, "ОП")).Append("</select></td>")
               .Append("<td>").Append(ParseHelpers.H(OpBudgetHelper.OpBudgetCommercial(first.opName))).Append("</td>")
@@ -1574,7 +1589,7 @@ WHERE pd.plan_discipline_id = ANY(@ids)", conn);
               .Append("<td><select class=\"input\" name=\"departmentName_").Append(rowKey).Append("\">").Append(OptionsListStrings(allDepartmentNames, first.dept, "Департамент")).Append("</select></td>");
         else
             sb.Append("<td class=\"col-year\"><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(first.year)).Append("\" readonly></td>")
-              .Append("<td><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(modVal)).Append("\" readonly></td>")
+              .Append("<td><input class=\"input input--readonly\" value=\"").Append(moduleSelected is >= 1 and <= 4 ? moduleSelected.Value + " модуль" : "1 модуль").Append("\" readonly></td>")
               .Append("<td><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(first.discNo)).Append("\" readonly></td>")
               .Append("<td><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(first.discName)).Append("\" readonly></td>")
               .Append("<td><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(first.opName)).Append("\" readonly></td>")
@@ -1904,6 +1919,7 @@ app.MapPost("/uiworkload/import", async (HttpContext ctx, NpgsqlDataSource ds, H
         var workTypeName = ExcelImportHelper.Get(row, "work_type");
         var hoursVal = ParseHelpers.DecimalOrNull(ExcelImportHelper.Get(row, "hours"));
         var facultyName = (ExcelImportHelper.Get(row, "faculty_name") ?? "").Trim();
+        if (!ParseHelpers.IsValidDisciplineNo(disciplineNo)) { errors.Add($"Дисциплина «{disciplineName}»: номер дисциплины может содержать только цифры."); continue; }
         if (string.IsNullOrWhiteSpace(disciplineName) || string.IsNullOrWhiteSpace(facultyName) || workTypeName is null || hoursVal is null || hoursVal < 0) continue;
         var yearNorm = (yearVal ?? "").Trim();
         var yearAlt = yearNorm.Replace("-", "/");
@@ -2133,6 +2149,36 @@ WHERE assignment_id = @assignmentId;", conn, tx);
             updateAssign.Parameters.AddWithValue("role", NpgsqlDbType.Text, (object?)role ?? DBNull.Value);
             updateAssign.Parameters.AddWithValue("assignmentId", NpgsqlDbType.Integer, assignmentIdValue);
             await updateAssign.ExecuteNonQueryAsync();
+        }
+
+        var moduleNo = ParseHelpers.IntOrNull(Get("module"));
+        if (planDisciplineId.HasValue && moduleNo is >= 1 and <= 4)
+        {
+            await using var getPlanCmd = new NpgsqlCommand("SELECT plan_id FROM plan_disciplines WHERE plan_discipline_id = @pdId", conn, tx);
+            getPlanCmd.Parameters.AddWithValue("pdId", NpgsqlDbType.Integer, planDisciplineId.Value);
+            var planIdObj = await getPlanCmd.ExecuteScalarAsync();
+            if (planIdObj is int planId)
+            {
+                await using var getModCmd = new NpgsqlCommand("SELECT module_id FROM plan_modules WHERE plan_id = @planId AND module_number = @modNo", conn, tx);
+                getModCmd.Parameters.AddWithValue("planId", NpgsqlDbType.Integer, planId);
+                getModCmd.Parameters.AddWithValue("modNo", NpgsqlDbType.Integer, moduleNo.Value);
+                var modIdObj = await getModCmd.ExecuteScalarAsync();
+                int moduleIdToSet;
+                if (modIdObj is int existingModId)
+                    moduleIdToSet = existingModId;
+                else
+                {
+                    await using var insMod = new NpgsqlCommand("INSERT INTO plan_modules (plan_id, module_name, module_number) VALUES (@planId, @name, @modNo) RETURNING module_id", conn, tx);
+                    insMod.Parameters.AddWithValue("planId", NpgsqlDbType.Integer, planId);
+                    insMod.Parameters.AddWithValue("name", NpgsqlDbType.Varchar, "Модуль " + moduleNo.Value);
+                    insMod.Parameters.AddWithValue("modNo", NpgsqlDbType.Integer, moduleNo.Value);
+                    moduleIdToSet = (int)(await insMod.ExecuteScalarAsync() ?? 0);
+                }
+                await using var updPd = new NpgsqlCommand("UPDATE plan_disciplines SET module_id = @moduleId WHERE plan_discipline_id = @pdId", conn, tx);
+                updPd.Parameters.AddWithValue("moduleId", NpgsqlDbType.Integer, moduleIdToSet);
+                updPd.Parameters.AddWithValue("pdId", NpgsqlDbType.Integer, planDisciplineId.Value);
+                await updPd.ExecuteNonQueryAsync();
+            }
         }
 
         var submittedWorkTypeIds = new List<int>();
@@ -2946,7 +2992,7 @@ LIMIT 500;
               .Append("<form id=\"").Append(formId).Append("\" method=\"post\" action=\"/uiplan/update\"></form>")
               .Append("<input type=\"hidden\" name=\"planId\" value=\"").Append(planIdDb).Append("\" form=\"").Append(formId).Append("\">")
               .Append("<input type=\"hidden\" name=\"planDisciplineId\" value=\"").Append(planDisciplineIdDb?.ToString() ?? "").Append("\" form=\"").Append(formId).Append("\">")
-              .Append("<input class=\"input\" name=\"disciplineNo\" value=\"").Append(ParseHelpers.H(disciplineNo)).Append("\" form=\"").Append(formId).Append("\" placeholder=\"№\">")
+              .Append("<input class=\"input\" name=\"disciplineNo\" value=\"").Append(ParseHelpers.H(disciplineNo)).Append("\" form=\"").Append(formId).Append("\" placeholder=\"№\" pattern=\"[0-9]*\" title=\"Только цифры\">")
               .Append("</td>")
               .Append("<td><input class=\"input\" name=\"disciplineName\" value=\"").Append(ParseHelpers.H(disciplineName)).Append("\" form=\"").Append(formId).Append("\"></td>")
               .Append("<td>").Append(ParseHelpers.H(implementingDepartment)).Append("</td>")
@@ -3024,7 +3070,7 @@ ORDER BY ep.name", conn))
           .Append("<td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>")
           .Append("<form id=\"").Append(newFormId).Append("\" method=\"post\" action=\"/uiplan/update\"></form>")
           .Append("<input type=\"hidden\" name=\"planDisciplineId\" value=\"\" form=\"").Append(newFormId).Append("\">")
-          .Append("<input class=\"input\" name=\"disciplineNo\" value=\"\" form=\"").Append(newFormId).Append("\" placeholder=\"№\"></td>")
+          .Append("<input class=\"input\" name=\"disciplineNo\" value=\"\" form=\"").Append(newFormId).Append("\" placeholder=\"№\" pattern=\"[0-9]*\" title=\"Только цифры\"></td>")
           .Append("<td><input class=\"input\" name=\"disciplineName\" value=\"\" form=\"").Append(newFormId).Append("\" placeholder=\"Название\"></td>")
           .Append("<td>—</td><td><input class=\"input\" name=\"implementingDepParent\" value=\"\" form=\"").Append(newFormId).Append("\"></td>")
           .Append("<td><select class=\"input\" name=\"disciplineKind\" form=\"").Append(newFormId).Append("\">").Append(OptionsListStrings(SelectOptions.DisciplineKinds, "", "Вид")).Append("</select></td>")
@@ -3307,6 +3353,7 @@ app.MapPost("/uiplan/import", async (HttpContext ctx, NpgsqlDataSource ds, HttpR
         var disciplineNo = ExcelImportHelper.Get(row, "discipline_no");
         var disciplineName = (ExcelImportHelper.Get(row, "discipline_name") ?? "").Trim();
         if (string.IsNullOrWhiteSpace(disciplineName)) continue;
+        if (!ParseHelpers.IsValidDisciplineNo(disciplineNo)) { errors.Add($"Дисциплина «{yearVal} / {disciplineName}»: номер дисциплины может содержать только цифры."); continue; }
         var opName = ExcelImportHelper.Get(row, "op");
         var departmentName = ExcelImportHelper.Get(row, "implementing_department");
         var yearNorm = (yearVal ?? "").Trim();
@@ -3417,6 +3464,8 @@ app.MapPost("/uiplan/update", async (
 
     if (string.IsNullOrWhiteSpace(disciplineName))
         errors.Add("Наименование дисциплины обязательно.");
+    if (!ParseHelpers.IsValidDisciplineNo(disciplineNo))
+        errors.Add("Номер дисциплины может содержать только цифры.");
     var creditsVal = ParseHelpers.DecimalOrNull(credits);
     if (creditsVal is not null && creditsVal < 0)
         errors.Add("Зач.ед. не могут быть отрицательными.");
@@ -4673,7 +4722,7 @@ LIMIT 500;", conn);
                 sb.Append("<td><input type='checkbox' class='row-select row-select-disc' disabled></td>");
             if (canEditDisc)
             {
-                sb.Append("<td><input class='input' name='disciplineNo_").Append(id).Append("' value='").Append(ParseHelpers.H(r.IsDBNull(1) ? "" : r.GetString(1))).Append("'></td>")
+                sb.Append("<td><input class='input' name='disciplineNo_").Append(id).Append("' value='").Append(ParseHelpers.H(r.IsDBNull(1) ? "" : r.GetString(1))).Append("' pattern=\"[0-9]*\" title=\"Только цифры\"></td>")
                   .Append("<td><input class='input' name='disciplineName_").Append(id).Append("' value='").Append(ParseHelpers.H(r.IsDBNull(2) ? "" : r.GetString(2))).Append("'></td>")
                   .Append("<td><select class='input' name='moduleId_").Append(id).Append("'>").Append(OptionsList(modules, moduleIdVal, "Модуль")).Append("</select></td>")
                   .Append("<td><select class='input' name='departmentId_").Append(id).Append("'>").Append(OptionsList(departments, deptIdVal, "Департамент")).Append("</select></td>")
@@ -4823,6 +4872,7 @@ app.MapPost("/uidisciplines/import", async (HttpContext ctx, NpgsqlDataSource ds
         var disciplineName = ExcelImportHelper.Get(row, "discipline_name");
         if (string.IsNullOrWhiteSpace(disciplineName)) continue;
         var disciplineNo = ExcelImportHelper.Get(row, "discipline_no");
+        if (!ParseHelpers.IsValidDisciplineNo(disciplineNo)) { errors.Add($"Строка «{ParseHelpers.H(disciplineName)}»: номер дисциплины может содержать только цифры."); continue; }
         var moduleName = ExcelImportHelper.Get(row, "module");
         var departmentName = ExcelImportHelper.Get(row, "department");
         var courseNo = ParseHelpers.IntOrNull(ExcelImportHelper.Get(row, "course_no"));
@@ -5006,6 +5056,11 @@ app.MapPost("/uidisciplines/save-batch-form", async (HttpContext ctx, NpgsqlData
         if (string.IsNullOrWhiteSpace(disciplineName))
         {
             errors.Add($"Наименование дисциплины обязательно (строка {rowKey})");
+            continue;
+        }
+        if (!ParseHelpers.IsValidDisciplineNo(disciplineNo))
+        {
+            errors.Add($"Номер дисциплины может содержать только цифры (строка {rowKey})");
             continue;
         }
         if (credits is not null && credits < 0)

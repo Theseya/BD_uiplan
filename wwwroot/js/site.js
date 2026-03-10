@@ -112,6 +112,7 @@ document.addEventListener("mousedown", (event) => {
   const workTypeOptions = document.querySelector("#wl-worktype-options");
   const workTypeHtml = workTypeOptions ? workTypeOptions.innerHTML : "";
   const yearOptionsHtml = (document.querySelector("#wl-year-options") || {}).innerHTML || "";
+  const moduleOptionsHtml = (document.querySelector("#wl-module-options") || {}).innerHTML || "";
   const opOptionsHtml = (document.querySelector("#wl-op-options") || {}).innerHTML || "";
   const levelOptionsHtml = (document.querySelector("#wl-level-options") || {}).innerHTML || "";
   const deptOptionsHtml = (document.querySelector("#wl-dept-options") || {}).innerHTML || "";
@@ -123,8 +124,8 @@ document.addEventListener("mousedown", (event) => {
   row.innerHTML = `
     <td><input type="checkbox" class="row-select row-select-wl" name="selectAssignmentId" value=""></td>
     <td><select class="input" name="year_${rowKey}">${yearOptionsHtml}</select></td>
-    <td><input class="input" name="module_${rowKey}" value="" placeholder="Модуль"></td>
-    <td><input class="input" name="disciplineNo_${rowKey}" value="" placeholder="№ дисциплины"></td>
+    <td><select class="input" name="module_${rowKey}">${moduleOptionsHtml}</select></td>
+    <td><input class="input" name="disciplineNo_${rowKey}" value="" placeholder="№ дисциплины" pattern="[0-9]*" title="Только цифры"></td>
     <td><input class="input" name="disciplineName_${rowKey}" value="" placeholder="Дисциплина"></td>
     <td><select class="input" name="opName_${rowKey}">${opOptionsHtml}</select></td>
     <td></td>
@@ -189,8 +190,10 @@ function recalcUnallocatedWorkload(ev) {
     var inputs = allRows[i].querySelectorAll("input[name^=\"hours_\"]");
     for (var j = 0; j < inputs.length; j++) totalAllocated += parseFloat(inputs[j].value) || 0;
   }
-  var unallocated = Math.max(0, effectivePlan - totalAllocated);
-  var val = (Math.round(unallocated * 100) / 100).toString();
+  var diff = effectivePlan - totalAllocated;
+  var val = diff >= 0
+    ? (Math.round(diff * 100) / 100).toString()
+    : "+" + (Math.round(-diff * 100) / 100).toString();
   for (var k = 0; k < allRows.length; k++) {
     var r = allRows[k];
     var cell = r.querySelector("td.cell-unallocated") || (r.cells && r.cells.length > 10 ? r.cells[10] : null);
@@ -238,7 +241,7 @@ document.addEventListener("mousedown", (event) => {
   const row = document.createElement("tr");
   row.innerHTML = `
     <td>новая<input type="hidden" name="rowId" value="${rowKey}"></td>
-    <td><input class="input" name="disciplineNo_${rowKey}" value=""></td>
+    <td><input class="input" name="disciplineNo_${rowKey}" value="" pattern="[0-9]*" title="Только цифры"></td>
     <td><input class="input" name="disciplineName_${rowKey}" value=""></td>
     <td><select class="input" name="moduleId_${rowKey}">${moduleHtml}</select></td>
     <td><select class="input" name="departmentId_${rowKey}">${deptHtml}</select></td>

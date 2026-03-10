@@ -28,6 +28,13 @@ public static class ParseHelpers
         return s == "on" || s == "true" || s == "1" || s == "да" || s == "yes";
     }
 
+    /// <summary>Номер дисциплины может быть пустым или содержать только цифры.</summary>
+    public static bool IsValidDisciplineNo(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return true;
+        return value.Trim().All(char.IsDigit);
+    }
+
     public static string NormalizeOpName(string? s)
     {
         if (string.IsNullOrWhiteSpace(s)) return "";
