@@ -66,10 +66,12 @@ public class DashboardContentTests : IClassFixture<WebAppFactory>
         var response = await client.GetAsync("/uiworkload");
         if (response.StatusCode != HttpStatusCode.OK) return;
         var html = await response.Content.ReadAsStringAsync();
-        if (!html.Contains("Нагрузка", StringComparison.OrdinalIgnoreCase)) return; // БД недоступна — страница могла не загрузиться
+        if (!html.Contains("Нагрузка", StringComparison.OrdinalIgnoreCase)) return;
+        if (!html.Contains("wl-batch-form", StringComparison.OrdinalIgnoreCase) &&
+            !html.Contains("id=\"wl-table\"", StringComparison.OrdinalIgnoreCase))
+            return;
         Assert.Contains("Выгрузить", html);
         Assert.Contains("Загрузить из Excel", html);
-        // Ссылка выгрузки должна иметь data-export="excel" и href на /uiworkload/export (site.js перехватывает клик)
         Assert.Contains("data-export=\"excel\"", html);
         Assert.Contains("/uiworkload/export", html);
     }

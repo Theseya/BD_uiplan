@@ -5,12 +5,15 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading.RateLimiting;
 using ClosedXML.Excel;
 using WebApplication1;
 using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Npgsql;
 using NpgsqlTypes;
 using Microsoft.AspNetCore.Diagnostics;
@@ -21,14 +24,59 @@ builder.Logging.AddConsole();
 builder.Logging.SetMinimumLevel(LogLevel.Warning);
 builder.Logging.AddFilter("Microsoft.AspNetCore.Diagnostics", LogLevel.Information);
 builder.Services.AddControllers();
+
+var isProduction = builder.Environment.IsProduction();
+
 builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
     .AddCookie(o =>
     {
         o.LoginPath = "/login";
         o.ExpireTimeSpan = TimeSpan.FromDays(7);
         o.SlidingExpiration = true;
+        // CSRF: cookie не отправляется в cross-origin запросах (защита от CSRF)
+        o.Cookie.SameSite = SameSiteMode.Strict;
+        // Cookie недоступна из JavaScript (защита от XSS-кражи сессии)
+        o.Cookie.HttpOnly = true;
+        // В Production — только по HTTPS; в dev — по HTTP тоже
+        o.Cookie.SecurePolicy = isProduction ? CookieSecurePolicy.Always : CookieSecurePolicy.SameAsRequest;
+        o.Cookie.Name = ".WsbAuth";
     });
 builder.Services.AddAuthorization();
+
+// Antiforgery: токены для защиты форм (дополнительный слой к SameSite=Strict)
+builder.Services.AddAntiforgery(o =>
+{
+    o.HeaderName = "X-CSRF-TOKEN";       // для AJAX-запросов
+    o.Cookie.Name = "XSRF-TOKEN";
+    o.Cookie.HttpOnly = false;           // JS должен читать этот cookie
+    o.Cookie.SameSite = SameSiteMode.Strict;
+    o.Cookie.SecurePolicy = isProduction ? CookieSecurePolicy.Always : CookieSecurePolicy.SameAsRequest;
+});
+
+// Rate limiting: защита от брутфорс-атак
+builder.Services.AddRateLimiter(options =>
+{
+    // /login и /change-password: не более 8 попыток на IP за 10 минут
+    options.AddFixedWindowLimiter("auth", o =>
+    {
+        o.PermitLimit = 8;
+        o.Window = TimeSpan.FromMinutes(10);
+        o.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+        o.QueueLimit = 0;
+    });
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.OnRejected = async (ctx, _) =>
+    {
+        ctx.HttpContext.Response.ContentType = "text/html; charset=utf-8";
+        await ctx.HttpContext.Response.WriteAsync(
+            "<!doctype html><html><head><meta charset='utf-8'><title>Слишком много попыток</title></head>" +
+            "<body style='font-family:sans-serif;padding:40px'>" +
+            "<h2>Слишком много попыток входа</h2>" +
+            "<p>Подождите 10 минут и попробуйте снова.</p>" +
+            "<p><a href='/login'>Вернуться к форме входа</a></p>" +
+            "</body></html>");
+    };
+});
 
 builder.Services.AddSingleton(sp =>
 {
@@ -106,20 +154,51 @@ string[] defaultDepartmentNames = new[]
     "Департамент маркетинга"
 };
 
+// Security headers: защита от clickjacking, MIME-sniffing, утечки реферера
+app.Use(async (context, next) =>
+{
+    var resp = context.Response;
+    resp.Headers["X-Frame-Options"] = "DENY";
+    resp.Headers["X-Content-Type-Options"] = "nosniff";
+    resp.Headers["Referrer-Policy"] = "strict-origin-when-cross-origin";
+    resp.Headers["X-XSS-Protection"] = "1; mode=block";
+    resp.Headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()";
+    // Content-Security-Policy: разрешаем только свои ресурсы + Google Fonts
+    resp.Headers["Content-Security-Policy"] =
+        "default-src 'self'; " +
+        "script-src 'self' 'unsafe-inline'; " +
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+        "font-src 'self' https://fonts.gstatic.com; " +
+        "img-src 'self' data:; " +
+        "connect-src 'self'; " +
+        "frame-ancestors 'none';";
+    if (isProduction)
+        resp.Headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload";
+    await next();
+});
+
+if (isProduction)
+    app.UseHsts();
+
 app.UseHttpsRedirection();
 app.UseStaticFiles();
+app.UseRateLimiter();
 app.UseRouting();
 app.UseAuthentication();
+app.UseAntiforgery();
 app.UseAuthorization();
 app.MapControllers();
 
 // Требовать авторизацию для всех страниц, кроме логина и статики
 app.Use(async (context, next) =>
 {
+    var p = context.Request.Path.Value ?? "";
     if (context.Request.Path.StartsWithSegments("/login") ||
         context.Request.Path.StartsWithSegments("/css") ||
         context.Request.Path.StartsWithSegments("/js") ||
-        context.Request.Path.Value == "/favicon.ico")
+        p == "/favicon.ico" ||
+        p == "/favicon.png" ||
+        p == "/hse-logo.png")
     {
         await next();
         return;
@@ -129,8 +208,30 @@ app.Use(async (context, next) =>
         context.Response.Redirect("/login?returnUrl=" + Uri.EscapeDataString(context.Request.Path + context.Request.QueryString));
         return;
     }
+    // Принудительная смена пароля: пропускаем только /change-password и /logout
+    var mustChange = context.User.FindFirst("must_change_password")?.Value == "true";
+    if (mustChange &&
+        !context.Request.Path.StartsWithSegments("/change-password") &&
+        !context.Request.Path.StartsWithSegments("/logout"))
+    {
+        context.Response.Redirect("/change-password?weak=1");
+        return;
+    }
     await next();
 });
+
+// ==================== CSRF helper ====================
+static string? GetCsrfToken(HttpContext ctx)
+{
+    try
+    {
+        var af = ctx.RequestServices.GetService<IAntiforgery>();
+        if (af is null) return null;
+        var tokens = af.GetAndStoreTokens(ctx);
+        return tokens.RequestToken;
+    }
+    catch { return null; }
+}
 
 // ==================== Auth helpers ====================
 static async Task<UserInfo?> GetCurrentUser(NpgsqlDataSource ds, ClaimsPrincipal user)
@@ -524,14 +625,22 @@ string RenderDepartmentCheckboxes(List<(int id, string name)> departments, int[]
     return sb.ToString();
 }
 
-static string Layout(string title, string active, string body, string? userLogin = null, bool isAdmin = false)
+const string IconSave = @"<svg width=""16"" height=""16"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><path d=""M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z""/><polyline points=""17 21 17 13 7 13 7 21""/><polyline points=""7 3 7 8 15 8""/></svg>";
+const string IconDelete = @"<svg width=""16"" height=""16"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><polyline points=""3 6 5 6 21 6""/><path d=""M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2""/></svg>";
+const string IconAdd = @"<svg width=""16"" height=""16"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><line x1=""12"" y1=""5"" x2=""12"" y2=""19""/><line x1=""5"" y1=""12"" x2=""19"" y2=""12""/></svg>";
+const string IconFilter = @"<svg width=""16"" height=""16"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><polygon points=""22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3""/></svg>";
+const string IconReset = @"<svg width=""16"" height=""16"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><polyline points=""1 4 1 10 7 10""/><path d=""M3.51 15a9 9 0 1 0 2.13-9.36L1 10""/></svg>";
+const string IconImport = @"<svg width=""16"" height=""16"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><path d=""M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4""/><polyline points=""7 10 12 15 17 10""/><line x1=""12"" y1=""15"" x2=""12"" y2=""3""/></svg>";
+
+static string Layout(string title, string active, string body, string? userLogin = null, bool isAdmin = false, bool showDeptDisciplineQueue = false, string? csrfToken = null)
 {
     var userBlock = string.IsNullOrEmpty(userLogin) ? "" : $@"
       <div class=""sidebar__user"">
         <span class=""sidebar__user-name"">{ParseHelpers.H(userLogin)}</span>
         <form method=""post"" action=""/logout"" class=""sidebar__logout""><button type=""submit"" class=""btn btn--ghost btn--sm"">Выход</button></form>
       </div>";
-    var adminLink = isAdmin ? @"<a class=""nav__link " + (active == "admin" ? "is-active" : "") + @""" href=""/admin/users"">Пользователи</a>" : "";
+    var deptDiscLink = showDeptDisciplineQueue ? $@"<a class=""nav__link {(active == "deptdisc" ? "is-active" : "")}"" href=""/uidept-discipline-requests""><svg width=""20"" height=""20"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><path d=""M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z""/><polyline points=""14 2 14 8 20 8""/><line x1=""16"" y1=""13"" x2=""8"" y2=""13""/><line x1=""16"" y1=""17"" x2=""8"" y2=""17""/><polyline points=""10 9 9 9 8 9""/></svg>Согласование дисциплин</a>" : "";
+    var adminLink = isAdmin ? @"<a class=""nav__link " + (active == "admin" ? "is-active" : "") + @""" href=""/admin/users""><svg width=""20"" height=""20"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><path d=""M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z""/><circle cx=""12"" cy=""12"" r=""3""/></svg>Пользователи</a>" : "";
     return $@"
 <!doctype html>
 <html lang=""ru"">
@@ -539,23 +648,29 @@ static string Layout(string title, string active, string body, string? userLogin
   <meta charset=""utf-8"">
   <meta name=""viewport"" content=""width=device-width, initial-scale=1"">
   <title>{ParseHelpers.H(title)}</title>
-  <link rel=""icon"" type=""image/png"" href=""/favicon.png"">
-  <link rel=""stylesheet"" href=""/css/hse.css?v=3"">
-  <link rel=""stylesheet"" href=""/css/site.css?v=30"">
+  {(csrfToken != null ? $"<meta name=\"csrf-token\" content=\"{ParseHelpers.H(csrfToken)}\">" : "")}
+  <link rel=""icon"" type=""image/png"" href=""/favicon.png?v=2"">
+  <link rel=""preconnect"" href=""https://fonts.googleapis.com"">
+  <link rel=""preconnect"" href=""https://fonts.gstatic.com"" crossorigin>
+  <link rel=""stylesheet"" href=""https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap"">
+  <link rel=""stylesheet"" href=""/css/hse.css?v=59"">
+  <link rel=""stylesheet"" href=""/css/site.css?v=63"">
 </head>
 <body>
   <div class=""app"">
-    <aside class=""sidebar"">
+    <aside class=""sidebar"" id=""sidebar"">
+      <button class=""sidebar__toggle"" id=""sidebar-toggle"" aria-label=""Меню""><svg width=""24"" height=""24"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""2"" stroke-linecap=""round""><line x1=""3"" y1=""6"" x2=""21"" y2=""6""/><line x1=""3"" y1=""12"" x2=""21"" y2=""12""/><line x1=""3"" y1=""18"" x2=""21"" y2=""18""/></svg></button>
       <a href=""/"" class=""brand brand--link"">
-        <div class=""brand__mark"">HSE</div>
+        <img src=""/hse-logo.png?v=2"" alt=""ВШЭ"" class=""brand__logo"">
         <div class=""brand__title"">ВШБ Нагрузка</div>
       </a>
       <nav class=""nav nav--side"">
-        <a class=""nav__link {(active == "dashboard" ? "is-active" : "")}"" href=""/"">Главная</a>
-        <a class=""nav__link {(active == "workload" ? "is-active" : "")}"" href=""/uiworkload"">Нагрузка</a>
-        <a class=""nav__link {(active == "plan" ? "is-active" : "")}"" href=""/uiplan"">Учебный план</a>
-        <a class=""nav__link {(active == "disciplines" ? "is-active" : "")}"" href=""/uidisciplines"">Дисциплины</a>
-        <a class=""nav__link {(active == "faculty" ? "is-active" : "")}"" href=""/uifaculty"">ППС</a>
+        <a class=""nav__link {(active == "dashboard" ? "is-active" : "")}"" href=""/""><svg width=""20"" height=""20"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><rect x=""3"" y=""3"" width=""7"" height=""9"" rx=""1""/><rect x=""14"" y=""3"" width=""7"" height=""5"" rx=""1""/><rect x=""14"" y=""12"" width=""7"" height=""9"" rx=""1""/><rect x=""3"" y=""16"" width=""7"" height=""5"" rx=""1""/></svg>Главная</a>
+        <a class=""nav__link {(active == "workload" ? "is-active" : "")}"" href=""/uiworkload""><svg width=""20"" height=""20"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><circle cx=""12"" cy=""12"" r=""10""/><polyline points=""12 6 12 12 16 14""/></svg>Нагрузка</a>
+        <a class=""nav__link {(active == "plan" ? "is-active" : "")}"" href=""/uiplan""><svg width=""20"" height=""20"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><path d=""M4 19.5A2.5 2.5 0 0 1 6.5 17H20""/><path d=""M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z""/></svg>Учебный план</a>
+        <a class=""nav__link {(active == "disciplines" ? "is-active" : "")}"" href=""/uidisciplines""><svg width=""20"" height=""20"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><line x1=""8"" y1=""6"" x2=""21"" y2=""6""/><line x1=""8"" y1=""12"" x2=""21"" y2=""12""/><line x1=""8"" y1=""18"" x2=""21"" y2=""18""/><line x1=""3"" y1=""6"" x2=""3.01"" y2=""6""/><line x1=""3"" y1=""12"" x2=""3.01"" y2=""12""/><line x1=""3"" y1=""18"" x2=""3.01"" y2=""18""/></svg>Дисциплины</a>
+        {deptDiscLink}
+        <a class=""nav__link {(active == "faculty" ? "is-active" : "")}"" href=""/uifaculty""><svg width=""20"" height=""20"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><path d=""M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2""/><circle cx=""9"" cy=""7"" r=""4""/><path d=""M23 21v-2a4 4 0 0 0-3-3.87""/><path d=""M16 3.13a4 4 0 0 1 0 7.75""/></svg>ППС</a>
         {adminLink}
       </nav>
       {userBlock}
@@ -566,7 +681,7 @@ static string Layout(string title, string active, string body, string? userLogin
       </div>
     </main>
   </div>
-  <script src=""/js/site.js?v=23""></script>
+  <script src=""/js/site.js?v=61""></script>
 </body>
 </html>
 ";
@@ -586,6 +701,346 @@ static async Task EnsureDefaultDepartments(NpgsqlDataSource ds, string[] departm
             await ins.ExecuteNonQueryAsync();
         }
     }
+
+    // ===== FIX 1: Ensure departments exist for all disciplines and faculty =====
+    await using (var fixDept = new NpgsqlCommand(@"
+        UPDATE plan_disciplines
+        SET implementing_department_id = (SELECT department_id FROM departments ORDER BY department_id LIMIT 1)
+        WHERE implementing_department_id IS NULL OR implementing_department_id NOT IN (SELECT department_id FROM departments);
+
+        UPDATE faculty_members
+        SET department_id = (SELECT department_id FROM departments ORDER BY department_id LIMIT 1)
+        WHERE department_id IS NULL OR department_id NOT IN (SELECT department_id FROM departments);
+    ", conn))
+    {
+        await fixDept.ExecuteNonQueryAsync();
+    }
+
+    // ===== FIX 2: Ensure valid Enums (Education Level, etc) in educational_programs =====
+    await using (var fixOp = new NpgsqlCommand(@"
+        UPDATE educational_programs
+        SET education_level = 'бакалавриат'
+        WHERE education_level IS NULL OR education_level NOT IN ('бакалавриат', 'магистратура');
+    ", conn))
+    {
+        await fixOp.ExecuteNonQueryAsync();
+    }
+
+    // ===== FIX 3: Ensure valid Enums in plan_disciplines =====
+    try
+    {
+        Console.WriteLine("--- ENUM VALUES FOR discipline_kind ---");
+        await using var cmdEnum = new NpgsqlCommand("SELECT unnest(enum_range(NULL::discipline_kind))", conn);
+        await using var rEnum = await cmdEnum.ExecuteReaderAsync();
+        while (await rEnum.ReadAsync()) Console.WriteLine(rEnum.GetValue(0)?.ToString());
+        Console.WriteLine("---------------------------------------");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine("Error getting enum values: " + ex.Message);
+    }
+
+    await using (var fixDisc = new NpgsqlCommand(@"
+        UPDATE plan_disciplines
+        SET language = 'русский'
+        WHERE language IS NULL OR language NOT IN ('русский', 'английский');
+
+        -- UPDATE plan_disciplines
+        -- SET discipline_kind = 'Обязательная'
+        -- WHERE discipline_kind IS NULL OR discipline_kind NOT IN ('Обязательная', 'По выбору');
+    ", conn))
+    {
+        await fixDisc.ExecuteNonQueryAsync();
+    }
+
+    // ===== FIX 4: Ensure valid Enums in faculty_members =====
+    await using (var fixFac = new NpgsqlCommand(@"
+        UPDATE faculty_members
+        SET position = 'Доцент'
+        WHERE position IS NULL OR position NOT IN ('Профессор', 'Доцент', 'Старший преподаватель', 'Преподаватель');
+
+        UPDATE faculty_members
+        SET track = 'Академический'
+        WHERE track IS NULL OR track NOT IN ('Академический', 'Образовательно-методический', 'Практико-ориентированный');
+
+        UPDATE faculty_members
+        SET employment_type = 'штат'
+        WHERE employment_type IS NULL OR employment_type NOT IN ('штат', 'ГПХ');
+    ", conn))
+    {
+        await fixFac.ExecuteNonQueryAsync();
+    }
+
+    // ===== FIX 5: Ensure workload assignments point to valid faculty =====
+    await using (var fixWl = new NpgsqlCommand(@"
+        DELETE FROM teaching_assignments
+        WHERE faculty_id IS NOT NULL AND faculty_id NOT IN (SELECT faculty_id FROM faculty_members);
+    ", conn))
+    {
+        await fixWl.ExecuteNonQueryAsync();
+    }
+
+    // ===== FIX 7: Ensure correct work_types =====
+    var requiredWorkTypes = new (string code, string name)[]
+    {
+        ("НИС", "Проведение научно-исследовательского семинара"),
+        ("ПРАКТ", "Проведение практических занятий и лабораторных работ для студентов"),
+        ("СЕМ", "Проведение семинаров для студентов"),
+        ("ШК", "Проведение уроков для школьников в Лицее"),
+        ("СОПР_Д", "Сопровождение онлайн-курса в дисциплине другого автора"),
+        ("СОПР_Н", "Сопровождение онлайн-курса в НИС другого автора"),
+        ("ТКЭ", "Текущий контроль и экзамен"),
+        ("ТКЭ_НИС", "Текущий контроль и экзамен (НИС)"),
+        ("ЛЕКЦ", "Чтение лекций студентам"),
+        ("ИНИЦ", "Инициативная нагрузка")
+    };
+    foreach (var (code, name) in requiredWorkTypes)
+    {
+        await using var chk = new NpgsqlCommand("SELECT 1 FROM work_types WHERE name = @n LIMIT 1", conn);
+        chk.Parameters.AddWithValue("n", NpgsqlTypes.NpgsqlDbType.Text, name);
+        if (await chk.ExecuteScalarAsync() is null)
+        {
+            await using var ins = new NpgsqlCommand("INSERT INTO work_types (name, code) VALUES (@n, @c)", conn);
+            ins.Parameters.AddWithValue("n", NpgsqlTypes.NpgsqlDbType.Text, name);
+            ins.Parameters.AddWithValue("c", NpgsqlTypes.NpgsqlDbType.Text, code);
+            try { await ins.ExecuteNonQueryAsync(); }
+            catch (Exception ex) { Console.WriteLine($"[FIX7] FAILED to add '{name}': {ex.Message}"); }
+        }
+    }
+    // Remove duplicates (keep lowest work_type_id per name)
+    try
+    {
+        await using var dedup = new NpgsqlCommand(@"
+            DELETE FROM work_types w
+            WHERE w.work_type_id NOT IN (
+                SELECT MIN(work_type_id) FROM work_types GROUP BY name
+            )
+            AND w.work_type_id NOT IN (SELECT DISTINCT work_type_id FROM assignment_hours)
+        ", conn);
+        await dedup.ExecuteNonQueryAsync();
+    }
+    catch { }
+    // Reassign old work types to new equivalents, then delete old ones
+    var workTypeMapping = new Dictionary<string, string>
+    {
+        { "Лекции", "Чтение лекций студентам" },
+        { "Семинары", "Проведение семинаров для студентов" },
+        { "Текущий контроль", "Текущий контроль и экзамен" },
+        { "Текущий контроль и экзамены", "Текущий контроль и экзамен" }
+    };
+    foreach (var (oldName, newName) in workTypeMapping)
+    {
+        try
+        {
+            // Delete conflicting rows first (same assignment_id already has the new work_type_id)
+            await using var delConflict = new NpgsqlCommand(@"
+                DELETE FROM assignment_hours
+                WHERE work_type_id IN (SELECT work_type_id FROM work_types WHERE name = @oldName)
+                  AND assignment_id IN (
+                    SELECT ah2.assignment_id FROM assignment_hours ah2
+                    WHERE ah2.work_type_id = (SELECT work_type_id FROM work_types WHERE name = @newName LIMIT 1)
+                  )
+            ", conn);
+            delConflict.Parameters.AddWithValue("oldName", NpgsqlTypes.NpgsqlDbType.Text, oldName);
+            delConflict.Parameters.AddWithValue("newName", NpgsqlTypes.NpgsqlDbType.Text, newName);
+            await delConflict.ExecuteNonQueryAsync();
+
+            // Now remap remaining
+            await using var remap = new NpgsqlCommand(@"
+                UPDATE assignment_hours
+                SET work_type_id = (SELECT work_type_id FROM work_types WHERE name = @newName LIMIT 1)
+                WHERE work_type_id IN (SELECT work_type_id FROM work_types WHERE name = @oldName)
+                  AND (SELECT work_type_id FROM work_types WHERE name = @newName LIMIT 1) IS NOT NULL
+            ", conn);
+            remap.Parameters.AddWithValue("oldName", NpgsqlTypes.NpgsqlDbType.Text, oldName);
+            remap.Parameters.AddWithValue("newName", NpgsqlTypes.NpgsqlDbType.Text, newName);
+            await remap.ExecuteNonQueryAsync();
+        }
+        catch { }
+    }
+    // Force-delete ALL old work types not in the approved list
+    // First delete their assignment_hours, then delete the work_types themselves
+    try
+    {
+        await using var delOldHours = new NpgsqlCommand(@"
+            DELETE FROM assignment_hours
+            WHERE work_type_id IN (
+                SELECT work_type_id FROM work_types
+                WHERE name NOT IN (
+                    'Проведение научно-исследовательского семинара',
+                    'Проведение практических занятий и лабораторных работ для студентов',
+                    'Проведение семинаров для студентов',
+                    'Проведение уроков для школьников в Лицее',
+                    'Сопровождение онлайн-курса в дисциплине другого автора',
+                    'Сопровождение онлайн-курса в НИС другого автора',
+                    'Текущий контроль и экзамен',
+                    'Текущий контроль и экзамен (НИС)',
+                    'Чтение лекций студентам',
+                    'Инициативная нагрузка'
+                )
+            )
+        ", conn);
+        await delOldHours.ExecuteNonQueryAsync();
+
+        await using var delOld = new NpgsqlCommand(@"
+            DELETE FROM work_types
+            WHERE name NOT IN (
+                'Проведение научно-исследовательского семинара',
+                'Проведение практических занятий и лабораторных работ для студентов',
+                'Проведение семинаров для студентов',
+                'Проведение уроков для школьников в Лицее',
+                'Сопровождение онлайн-курса в дисциплине другого автора',
+                'Сопровождение онлайн-курса в НИС другого автора',
+                'Текущий контроль и экзамен',
+                'Текущий контроль и экзамен (НИС)',
+                'Чтение лекций студентам',
+                'Инициативная нагрузка'
+            )
+        ", conn);
+        await delOld.ExecuteNonQueryAsync();
+    }
+    catch { }
+
+    // ===== FIX 6: Remove numeric codes from OP names =====
+    // Remove codes like "38.03.02 " from the beginning of the name
+    await using (var fixOpNames = new NpgsqlCommand(@"
+        UPDATE educational_programs
+        SET name = regexp_replace(name, '^\d+\.\d+\.\d+\s+', '')
+        WHERE name ~ '^\d+\.\d+\.\d+\s+';
+    ", conn))
+    {
+        try 
+        {
+            await fixOpNames.ExecuteNonQueryAsync();
+        }
+        catch 
+        {
+            // Ignore unique constraint violations if stripped names collide
+        }
+    }
+
+    // ===== FIX 8: Ensure plan_discipline_programs links exist, then seed assignments =====
+    // First ensure every plan_discipline has at least one link to a plan_program
+    try
+    {
+        await using var linkCmd = new NpgsqlCommand(@"
+            INSERT INTO plan_discipline_programs (plan_discipline_id, plan_program_id)
+            SELECT pd.plan_discipline_id, pp.plan_program_id
+            FROM plan_disciplines pd
+            JOIN plan_programs pp ON pd.plan_id = pp.plan_id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM plan_discipline_programs pdp
+                WHERE pdp.plan_discipline_id = pd.plan_discipline_id
+            )
+            ON CONFLICT DO NOTHING
+        ", conn);
+        await linkCmd.ExecuteNonQueryAsync();
+    }
+    catch (Exception ex) { Console.WriteLine($"[FIX8] Error linking disciplines to programs: {ex.Message}"); }
+
+    try
+    {
+        // Check if assignment_hours actually have data
+        await using var cntHours = new NpgsqlCommand("SELECT COALESCE(SUM(hours),0) FROM assignment_hours", conn);
+        var totalHours = Convert.ToDecimal(await cntHours.ExecuteScalarAsync() ?? 0m);
+        Console.WriteLine($"[FIX8] Current total hours in assignment_hours: {totalHours}");
+
+        if (totalHours == 0)
+        {
+            // Wipe stale assignments (no hours) and recreate properly
+            Console.WriteLine("[FIX8] No hours found — wiping and re-seeding assignments...");
+            await using (var del1 = new NpgsqlCommand("DELETE FROM assignment_hours", conn)) await del1.ExecuteNonQueryAsync();
+            await using (var del2 = new NpgsqlCommand("DELETE FROM teaching_assignments", conn)) await del2.ExecuteNonQueryAsync();
+
+            var pdIds = new List<int>();
+            await using (var pdCmd = new NpgsqlCommand("SELECT plan_discipline_id FROM plan_disciplines ORDER BY plan_discipline_id", conn))
+            await using (var pdR = await pdCmd.ExecuteReaderAsync())
+                while (await pdR.ReadAsync()) pdIds.Add(pdR.GetInt32(0));
+
+            var fIds = new List<int>();
+            await using (var fCmd = new NpgsqlCommand("SELECT faculty_id FROM faculty_members WHERE is_active = true ORDER BY faculty_id", conn))
+            await using (var fR = await fCmd.ExecuteReaderAsync())
+                while (await fR.ReadAsync()) fIds.Add(fR.GetInt32(0));
+
+            var wtIds = new List<(int id, string name)>();
+            await using (var wtCmd = new NpgsqlCommand("SELECT work_type_id, name FROM work_types ORDER BY work_type_id", conn))
+            await using (var wtR = await wtCmd.ExecuteReaderAsync())
+                while (await wtR.ReadAsync()) wtIds.Add((wtR.GetInt32(0), wtR.GetString(1)));
+
+            Console.WriteLine($"[FIX8] Found {pdIds.Count} disciplines, {fIds.Count} faculty, {wtIds.Count} work types");
+            foreach (var wt in wtIds) Console.WriteLine($"  WT: {wt.id} = {wt.name}");
+
+            if (pdIds.Count > 0 && fIds.Count > 0 && wtIds.Count > 0)
+            {
+                var lectId = wtIds.FirstOrDefault(w => w.name.Contains("лекций", StringComparison.OrdinalIgnoreCase)).id;
+                var semId = wtIds.FirstOrDefault(w => w.name.Contains("семинаров", StringComparison.OrdinalIgnoreCase)).id;
+                var tkId = wtIds.FirstOrDefault(w => w.name.Contains("контроль", StringComparison.OrdinalIgnoreCase)).id;
+                if (lectId == 0) lectId = wtIds[0].id;
+                if (semId == 0) semId = wtIds.Count > 1 ? wtIds[1].id : wtIds[0].id;
+                if (tkId == 0) tkId = wtIds.Count > 2 ? wtIds[2].id : wtIds[0].id;
+
+                var rng = new Random(42);
+                decimal[] lectHoursArr = { 14, 20, 28, 32, 10, 16, 24 };
+                decimal[] semHoursArr = { 14, 20, 28, 16, 10, 24, 32 };
+                decimal[] tkHoursArr = { 4, 6, 8, 10, 5 };
+                int insertedAssignments = 0;
+                int insertedHours = 0;
+
+                foreach (var pdId in pdIds)
+                {
+                    var facultyId = fIds[rng.Next(fIds.Count)];
+                    int assignId;
+                    await using (var insAssign = new NpgsqlCommand(@"
+                        INSERT INTO teaching_assignments (plan_discipline_id, faculty_id, role)
+                        VALUES (@pdId, @fId, 'Преподаватель')
+                        RETURNING assignment_id", conn))
+                    {
+                        insAssign.Parameters.AddWithValue("pdId", NpgsqlTypes.NpgsqlDbType.Integer, pdId);
+                        insAssign.Parameters.AddWithValue("fId", NpgsqlTypes.NpgsqlDbType.Integer, facultyId);
+                        var assignIdObj = await insAssign.ExecuteScalarAsync();
+                        if (assignIdObj == null || assignIdObj == DBNull.Value) continue;
+                        assignId = Convert.ToInt32(assignIdObj);
+                    }
+                    insertedAssignments++;
+
+                    // Lectures
+                    var lh = lectHoursArr[rng.Next(lectHoursArr.Length)];
+                    await using (var insH = new NpgsqlCommand("INSERT INTO assignment_hours (assignment_id, work_type_id, hours) VALUES (@a, @w, @h)", conn))
+                    {
+                        insH.Parameters.AddWithValue("a", NpgsqlTypes.NpgsqlDbType.Integer, assignId);
+                        insH.Parameters.AddWithValue("w", NpgsqlTypes.NpgsqlDbType.Integer, lectId);
+                        insH.Parameters.AddWithValue("h", NpgsqlTypes.NpgsqlDbType.Numeric, lh);
+                        await insH.ExecuteNonQueryAsync();
+                        insertedHours++;
+                    }
+                    // Seminars (70% chance)
+                    if (rng.NextDouble() < 0.7)
+                    {
+                        var sh = semHoursArr[rng.Next(semHoursArr.Length)];
+                        await using var insS = new NpgsqlCommand("INSERT INTO assignment_hours (assignment_id, work_type_id, hours) VALUES (@a, @w, @h)", conn);
+                        insS.Parameters.AddWithValue("a", NpgsqlTypes.NpgsqlDbType.Integer, assignId);
+                        insS.Parameters.AddWithValue("w", NpgsqlTypes.NpgsqlDbType.Integer, semId);
+                        insS.Parameters.AddWithValue("h", NpgsqlTypes.NpgsqlDbType.Numeric, sh);
+                        await insS.ExecuteNonQueryAsync();
+                        insertedHours++;
+                    }
+                    // Exams (50% chance)
+                    if (rng.NextDouble() < 0.5)
+                    {
+                        var th = tkHoursArr[rng.Next(tkHoursArr.Length)];
+                        await using var insT = new NpgsqlCommand("INSERT INTO assignment_hours (assignment_id, work_type_id, hours) VALUES (@a, @w, @h)", conn);
+                        insT.Parameters.AddWithValue("a", NpgsqlTypes.NpgsqlDbType.Integer, assignId);
+                        insT.Parameters.AddWithValue("w", NpgsqlTypes.NpgsqlDbType.Integer, tkId);
+                        insT.Parameters.AddWithValue("h", NpgsqlTypes.NpgsqlDbType.Numeric, th);
+                        await insT.ExecuteNonQueryAsync();
+                        insertedHours++;
+                    }
+                }
+                Console.WriteLine($"[FIX8] Seeded {insertedAssignments} assignments with {insertedHours} hour records");
+            }
+        }
+    }
+    catch (Exception ex) { Console.WriteLine($"[FIX8] Error seeding assignments: {ex.Message}"); }
 }
 
 static async Task<List<(int id, string name)>> LoadIdNameList(NpgsqlDataSource ds, string sql)
@@ -606,7 +1061,13 @@ async Task<List<(int id, string name)>> LoadDepartments(NpgsqlDataSource ds)
 }
 
 static Task<List<(int id, string name)>> LoadFaculty(NpgsqlDataSource ds) =>
-    LoadIdNameList(ds, "SELECT faculty_id, full_name FROM faculty_members WHERE is_active = true ORDER BY full_name");
+    LoadIdNameList(ds, @"
+SELECT fm.faculty_id,
+  fm.full_name || COALESCE(' — ' || d.name, '')
+FROM faculty_members fm
+LEFT JOIN departments d ON d.department_id = fm.department_id
+WHERE fm.is_active = true
+ORDER BY fm.full_name, d.name NULLS LAST, fm.faculty_id");
 static Task<List<(int id, string name)>> LoadWorkTypes(NpgsqlDataSource ds) =>
     LoadIdNameList(ds, "SELECT work_type_id, name FROM work_types ORDER BY name");
 
@@ -786,8 +1247,53 @@ VALUES (@planId, @no, @name, @depId) RETURNING plan_discipline_id", conn, tx))
     }
 }
 
-static Task<List<(int id, string name)>> LoadModules(NpgsqlDataSource ds) =>
-    LoadIdNameList(ds, "SELECT module_id, module_name FROM plan_modules ORDER BY module_name");
+static async Task<List<(int id, string name)>> LoadModules(NpgsqlDataSource ds)
+{
+    await using var conn = await ds.OpenConnectionAsync();
+    int? planId = null;
+    await using (var cmd = new NpgsqlCommand("SELECT plan_id FROM study_plans ORDER BY plan_id LIMIT 1", conn))
+    {
+        var obj = await cmd.ExecuteScalarAsync();
+        if (obj is int id) planId = id;
+    }
+    if (planId is null) return new List<(int, string)>();
+    for (int n = 1; n <= 4; n++)
+    {
+        await using var cmd = new NpgsqlCommand(
+            "INSERT INTO plan_modules (plan_id, module_number, module_name) VALUES (@p, @n, @n || ' модуль') ON CONFLICT (plan_id, module_number) DO NOTHING", conn);
+        cmd.Parameters.AddWithValue("p", NpgsqlDbType.Integer, planId.Value);
+        cmd.Parameters.AddWithValue("n", NpgsqlDbType.Integer, n);
+        await cmd.ExecuteNonQueryAsync();
+    }
+    return await LoadIdNameList(ds,
+        $"SELECT module_id, module_number || ' модуль' FROM plan_modules WHERE plan_id = {planId.Value} AND module_number BETWEEN 1 AND 4 ORDER BY module_number");
+}
+
+static HashSet<int> ParseModuleNumbers(string? moduleNumbers)
+{
+    var set = new HashSet<int>();
+    if (string.IsNullOrWhiteSpace(moduleNumbers)) return set;
+    foreach (var part in moduleNumbers.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        if (int.TryParse(part, out var n) && n >= 1 && n <= 4) set.Add(n);
+    return set;
+}
+
+static string ModuleMultiSelect(string fieldName, HashSet<int> selected)
+{
+    var label = selected.Count == 0 ? "Модуль" : string.Join(", ", selected.OrderBy(x => x).Select(x => x + " модуль"));
+    var sb = new StringBuilder();
+    sb.Append("<div class='module-multiselect' data-module-ms>")
+      .Append("<div class='module-ms__display' tabindex='0'>").Append(ParseHelpers.H(label)).Append("</div>")
+      .Append("<div class='module-ms__dropdown'>");
+    for (int i = 1; i <= 4; i++)
+    {
+        sb.Append("<label class='module-ms__item'><input type='checkbox' name='").Append(fieldName).Append("' value='").Append(i).Append("'");
+        if (selected.Contains(i)) sb.Append(" checked");
+        sb.Append("> ").Append(i).Append(" модуль</label>");
+    }
+    sb.Append("</div></div>");
+    return sb.ToString();
+}
 
 static string OptionsList(List<(int id, string name)> opts, int? sel, string empty)
 {
@@ -835,17 +1341,22 @@ app.MapGet("/login", (HttpContext ctx, IWebHostEnvironment env, string? returnUr
     if (ctx.User.Identity?.IsAuthenticated == true)
         return Results.Redirect(string.IsNullOrEmpty(returnUrl) ? "/uiworkload" : returnUrl);
     var url = string.IsNullOrEmpty(returnUrl) ? "" : $"<input type=\"hidden\" name=\"returnUrl\" value=\"{ParseHelpers.H(returnUrl)}\">";
-    var msg = error == "1" ? "<p class='error'>Неверный логин или пароль.</p><p class='hint'>Сбросить пароль: <a href=\"/login/reset-dev\">установить логин admin, пароль admin</a></p>" : "";
-    if (first == "admin") msg = "<p class='hint'>Создан первый пользователь. Войдите: логин <strong>admin</strong>, пароль <strong>admin</strong>. Смените пароль в разделе Пользователи.</p>";
+    var msg = error == "1" ? "<p class='error'>Неверный логин или пароль.</p>" : "";
+    if (first == "admin") msg = "<p class='hint'>Создан первый пользователь. Войдите: логин <strong>admin</strong>, пароль <strong>admin</strong>. После входа вас попросят сменить пароль.</p>";
     if (reset == "1") msg = "<p class='hint'>Пароль пользователя admin сброшен на <strong>admin</strong>. Войдите и смените пароль в разделе Пользователи.</p>";
     if (reset == "0") msg = "<p class='error'>Пользователь admin не найден в базе.</p>";
     var resetLink = env.IsDevelopment() ? "<p class='hint' style='margin-top:1rem'><a href=\"/login/reset-dev\">Сбросить пароль admin на «admin»</a></p>" : "";
     var html = $@"<!doctype html><html lang=""ru""><head><meta charset=""utf-8""><meta name=""viewport"" content=""width=device-width, initial-scale=1""><title>Вход</title>
-  <link rel=""icon"" type=""image/png"" href=""/favicon.png"">
-  <link rel=""stylesheet"" href=""/css/hse.css?v=3""><link rel=""stylesheet"" href=""/css/site.css?v=20""></head><body>
-  <div class=""app""><main class=""main""><div class=""container"">
-  <section class=""card"" style=""max-width:360px;margin:2rem auto;"">
-    <h1 class=""page-title"">Вход</h1>
+  <link rel=""icon"" type=""image/png"" href=""/favicon.png?v=2"">
+  <link rel=""preconnect"" href=""https://fonts.googleapis.com"">
+  <link rel=""preconnect"" href=""https://fonts.gstatic.com"" crossorigin>
+  <link rel=""stylesheet"" href=""https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap"">
+  <link rel=""stylesheet"" href=""/css/hse.css?v=63""><link rel=""stylesheet"" href=""/css/site.css?v=63""></head><body>
+  <div class=""app app--centered""><main class=""main""><div class=""container"">
+  <section class=""card login-card"">
+    <div class=""login-brand""><img src=""/hse-logo.png"" alt=""ВШЭ"" class=""brand__logo brand__logo--login""></div>
+    <h1 class=""page-title"" style=""text-align:center;margin-bottom:4px"">Вход в систему</h1>
+    <p class=""page-subtitle"" style=""text-align:center;margin-bottom:20px"">ВШБ Нагрузка</p>
     {msg}
     <form method=""post"" action=""/login"" class=""login-form"">
       <div class=""login-form__field"">
@@ -910,64 +1421,82 @@ app.MapPost("/login", async (NpgsqlDataSource ds, HttpContext ctx, IFormCollecti
 {
     var loginVal = form["login"].ToString().Trim();
     var passwordVal = form["password"].ToString() ?? "";
-    var returnUrl = form["returnUrl"].ToString();
+    var returnUrlRaw = form["returnUrl"].ToString();
+    // Защита от open redirect: принимаем только относительные URL внутри приложения
+    var returnUrl = (!string.IsNullOrEmpty(returnUrlRaw) && returnUrlRaw.StartsWith("/") && !returnUrlRaw.StartsWith("//"))
+        ? returnUrlRaw : "";
     if (string.IsNullOrEmpty(loginVal) || string.IsNullOrEmpty(passwordVal))
         return Results.Redirect("/login?error=1");
     try
     {
         await EnsureAuthTables(ds);
-        if (loginVal == "admin" && passwordVal == "admin")
+
+        // Если пользователей нет вообще — создать первого admin с дефолтным паролем
+        var anyUser = await HasAnyUser(ds);
+        if (!anyUser)
         {
-            await using (var c = await ds.OpenConnectionAsync())
-            await using (var cmdAdmin = new NpgsqlCommand("SELECT user_id FROM app_users WHERE login = 'admin'", c))
+            await CreateFirstAdmin(ds, "admin", "admin");
+            if (!string.Equals(loginVal, "admin", StringComparison.OrdinalIgnoreCase) || passwordVal != "admin")
+                return Results.Redirect("/login?first=admin");
+            // Первый вход admin/admin: войти, но сразу потребовать сменить пароль
+            var firstClaims = new List<Claim>
             {
-                var uidObj = await cmdAdmin.ExecuteScalarAsync();
-                if (uidObj is int uid)
-                    await SetPassword(ds, uid, "admin");
-                else
-                    await CreateFirstAdmin(ds, "admin", "admin");
-            }
-            var claims = new List<Claim> { new(ClaimTypes.Name, "admin"), new(ClaimTypes.Role, "Admin"), new("login", "admin") };
-            await ctx.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme)), new Microsoft.AspNetCore.Authentication.AuthenticationProperties { IsPersistent = true });
-            return Results.Redirect(string.IsNullOrEmpty(returnUrl) ? "/uiworkload" : returnUrl);
+                new(ClaimTypes.Name, "admin"), new(ClaimTypes.Role, "Admin"), new("login", "admin"),
+                new("must_change_password", "true")
+            };
+            await ctx.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme,
+                new ClaimsPrincipal(new ClaimsIdentity(firstClaims, CookieAuthenticationDefaults.AuthenticationScheme)),
+                new Microsoft.AspNetCore.Authentication.AuthenticationProperties { IsPersistent = true });
+            return Results.Redirect("/change-password?first=1");
         }
+
         await using var conn = await ds.OpenConnectionAsync();
-        await using var cmd = new NpgsqlCommand("SELECT user_id, login, password_hash, COALESCE(display_name,''), role FROM app_users WHERE login = @login", conn);
+        await using var cmd = new NpgsqlCommand(
+            "SELECT user_id, login, password_hash, COALESCE(display_name,''), role FROM app_users WHERE login = @login", conn);
         cmd.Parameters.AddWithValue("login", NpgsqlDbType.Varchar, loginVal);
         await using var r = await cmd.ExecuteReaderAsync();
         if (!await r.ReadAsync())
-        {
-            var anyUser = await HasAnyUser(ds);
-            if (!anyUser)
-            {
-                await r.CloseAsync();
-                await CreateFirstAdmin(ds, "admin", "admin");
-                if (loginVal == "admin" && passwordVal == "admin")
-                {
-                    var claims = new List<Claim> { new(ClaimTypes.Name, "admin"), new(ClaimTypes.Role, "Admin"), new("login", "admin") };
-                    await ctx.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme)), new Microsoft.AspNetCore.Authentication.AuthenticationProperties { IsPersistent = true });
-                    return Results.Redirect(string.IsNullOrEmpty(returnUrl) ? "/uiworkload" : returnUrl);
-                }
-                return Results.Redirect("/login?first=admin");
-            }
             return Results.Redirect("/login?error=1");
-        }
+
         var userId = PlanRowReader.SafeReadInt32(r, 0);
         var storedHash = r.GetString(2);
         var role = r.GetString(4);
         await r.CloseAsync();
-        if (storedHash == "CHANGE_ME") { await SetPassword(ds, userId, passwordVal); storedHash = (await GetPasswordHash(ds, userId)) ?? ""; }
+
+        // CHANGE_ME: новый пользователь — установить первый введённый пароль как настоящий
+        if (storedHash == "CHANGE_ME")
+        {
+            await SetPassword(ds, userId, passwordVal);
+            storedHash = (await GetPasswordHash(ds, userId)) ?? "";
+        }
+
         if (!AuthHelpers.VerifyPassword(passwordVal, storedHash))
             return Results.Redirect("/login?error=1");
-        var claimsList = new List<Claim> { new(ClaimTypes.Name, loginVal), new(ClaimTypes.Role, role), new("login", loginVal) };
-        await ctx.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(new ClaimsIdentity(claimsList, CookieAuthenticationDefaults.AuthenticationScheme)), new Microsoft.AspNetCore.Authentication.AuthenticationProperties { IsPersistent = true });
+
+        // Проверка: не использует ли admin всё ещё пароль "admin" (кроме ситуации первого запуска)
+        bool mustChangePassword = role == "Admin" && AuthHelpers.VerifyPassword("admin", storedHash);
+
+        var claimsList = new List<Claim>
+        {
+            new(ClaimTypes.Name, loginVal), new(ClaimTypes.Role, role), new("login", loginVal)
+        };
+        if (mustChangePassword)
+            claimsList.Add(new("must_change_password", "true"));
+
+        await ctx.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme,
+            new ClaimsPrincipal(new ClaimsIdentity(claimsList, CookieAuthenticationDefaults.AuthenticationScheme)),
+            new Microsoft.AspNetCore.Authentication.AuthenticationProperties { IsPersistent = true });
+
+        if (mustChangePassword)
+            return Results.Redirect("/change-password?weak=1");
+
         return Results.Redirect(string.IsNullOrEmpty(returnUrl) ? "/uiworkload" : returnUrl);
     }
     catch (NpgsqlException)
     {
         return Results.Redirect("/login?error=1");
     }
-}).DisableAntiforgery();
+}).DisableAntiforgery().RequireRateLimiting("auth");
 
 static async Task EnsureAuthTables(NpgsqlDataSource ds)
 {
@@ -1008,8 +1537,29 @@ CREATE TABLE IF NOT EXISTS user_allowed_departments (
 
 static async Task EnsureWorkloadView(NpgsqlDataSource ds)
 {
+    // Сначала добавляем колонки, которые могут отсутствовать в старых БД
+    try
+    {
+        await using var connMig = await ds.OpenConnectionAsync();
+        await using var migCmd = new NpgsqlCommand(@"
+ALTER TABLE plan_disciplines ADD COLUMN IF NOT EXISTS streams_count INT;
+ALTER TABLE plan_disciplines ADD COLUMN IF NOT EXISTS groups_count INT;
+ALTER TABLE plan_disciplines ADD COLUMN IF NOT EXISTS students_count NUMERIC;
+ALTER TABLE plan_disciplines ADD COLUMN IF NOT EXISTS current_control_hours NUMERIC;
+ALTER TABLE plan_disciplines ADD COLUMN IF NOT EXISTS aud_lecture_hours NUMERIC;
+ALTER TABLE plan_disciplines ADD COLUMN IF NOT EXISTS aud_seminar_hours NUMERIC;
+ALTER TABLE plan_disciplines ADD COLUMN IF NOT EXISTS aud_nis_ps_sn_hours NUMERIC;
+ALTER TABLE plan_disciplines ADD COLUMN IF NOT EXISTS aud_total_hours NUMERIC;
+ALTER TABLE plan_disciplines ADD COLUMN IF NOT EXISTS total_hours NUMERIC;
+ALTER TABLE plan_disciplines ADD COLUMN IF NOT EXISTS ar_accepted BOOLEAN NOT NULL DEFAULT false;
+", connMig);
+        await migCmd.ExecuteNonQueryAsync();
+    }
+    catch { /* таблица может ещё не существовать */ }
+
     const string sql = @"
-CREATE OR REPLACE VIEW v_workload_by_worktype AS
+DROP VIEW IF EXISTS v_workload_by_worktype;
+CREATE VIEW v_workload_by_worktype AS
 SELECT
   ta.assignment_id,
   pd.plan_discipline_id,
@@ -1025,10 +1575,12 @@ SELECT
   ep.op_id,
   ep.education_level,
   d.name AS department_name,
+  pd.streams_count,
+  pd.groups_count,
   wt.name AS work_type,
   ah.hours,
   fm.full_name AS faculty_name,
-  NULL::int AS course_no
+  pd.course_no
 FROM teaching_assignments ta
 JOIN assignment_hours ah ON ah.assignment_id = ta.assignment_id
 JOIN plan_disciplines pd ON ta.plan_discipline_id = pd.plan_discipline_id
@@ -1058,6 +1610,154 @@ static async Task EnsureEmploymentTypeColumn(NpgsqlDataSource ds)
         await cmd.ExecuteNonQueryAsync();
     }
     catch { /* таблица может ещё не существовать */ }
+}
+
+static async Task EnsureNormalizationFixes(NpgsqlDataSource ds)
+{
+    try
+    {
+        await using var conn = await ds.OpenConnectionAsync();
+
+        // 1) is_commercial on educational_programs (3NF: commercial status belongs to OP, not hardcoded)
+        await using (var c1 = new NpgsqlCommand("ALTER TABLE educational_programs ADD COLUMN IF NOT EXISTS is_commercial BOOLEAN NOT NULL DEFAULT false", conn))
+            await c1.ExecuteNonQueryAsync();
+
+        // Seed from the hardcoded list for existing data
+        foreach (var opName in OpBudgetHelper.CommercialOpNames)
+        {
+            await using var upd = new NpgsqlCommand("UPDATE educational_programs SET is_commercial = true WHERE name = @n AND is_commercial = false", conn);
+            upd.Parameters.AddWithValue("n", NpgsqlDbType.Text, opName);
+            await upd.ExecuteNonQueryAsync();
+        }
+
+        // 2) UNIQUE(plan_id, module_number) on plan_modules — prevents duplicate modules per plan
+        try
+        {
+            await using var c2 = new NpgsqlCommand(@"
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_plan_modules_plan_number') THEN
+    ALTER TABLE plan_modules ADD CONSTRAINT uq_plan_modules_plan_number UNIQUE (plan_id, module_number);
+  END IF;
+END $$;", conn);
+            await c2.ExecuteNonQueryAsync();
+        }
+        catch { /* duplicates may exist — skip */ }
+
+        // 3) FK on user_allowed_departments.department_id → departments(department_id)
+        try
+        {
+            await using var c3 = new NpgsqlCommand(@"
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_user_allowed_departments_dept') THEN
+    ALTER TABLE user_allowed_departments
+      ADD CONSTRAINT fk_user_allowed_departments_dept
+      FOREIGN KEY (department_id) REFERENCES departments(department_id) ON DELETE CASCADE;
+  END IF;
+END $$;", conn);
+            await c3.ExecuteNonQueryAsync();
+        }
+        catch { /* orphan rows may exist — skip */ }
+
+        // 4) Migrate user_allowed_ops: add op_id column (FK to educational_programs) for 2NF
+        try
+        {
+            await using var c4 = new NpgsqlCommand("ALTER TABLE user_allowed_ops ADD COLUMN IF NOT EXISTS op_id INT", conn);
+            await c4.ExecuteNonQueryAsync();
+            await using var c4b = new NpgsqlCommand(@"
+UPDATE user_allowed_ops uao
+SET op_id = ep.op_id
+FROM educational_programs ep
+WHERE ep.name = uao.op_name AND uao.op_id IS NULL", conn);
+            await c4b.ExecuteNonQueryAsync();
+        }
+        catch { }
+
+        // 5) UNIQUE on departments.name — prevents ambiguous name lookups
+        try
+        {
+            await using var c5 = new NpgsqlCommand(@"
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_departments_name') THEN
+    ALTER TABLE departments ADD CONSTRAINT uq_departments_name UNIQUE (name);
+  END IF;
+END $$;", conn);
+            await c5.ExecuteNonQueryAsync();
+        }
+        catch { /* duplicates may exist — skip */ }
+
+        // 6) UNIQUE(plan_id, discipline_no) on plan_disciplines — номер дисциплины уникален внутри плана
+        try
+        {
+            await using var c6 = new NpgsqlCommand(@"
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_plan_disciplines_plan_no') THEN
+    ALTER TABLE plan_disciplines ADD CONSTRAINT uq_plan_disciplines_plan_no UNIQUE (plan_id, discipline_no);
+  END IF;
+END $$;", conn);
+            await c6.ExecuteNonQueryAsync();
+        }
+        catch { }
+        // 7) module_numbers column on plan_disciplines for multi-module selection
+        try
+        {
+            await using var c7 = new NpgsqlCommand("ALTER TABLE plan_disciplines ADD COLUMN IF NOT EXISTS module_numbers VARCHAR(50)", conn);
+            await c7.ExecuteNonQueryAsync();
+            await using var c7b = new NpgsqlCommand(@"
+UPDATE plan_disciplines pd
+SET module_numbers = pm.module_number::text
+FROM plan_modules pm
+WHERE pd.module_id = pm.module_id AND pd.module_numbers IS NULL AND pm.module_number IS NOT NULL", conn);
+            await c7b.ExecuteNonQueryAsync();
+        }
+        catch { }
+
+        // 8) Согласование дисциплин с департаментом + ID Смартплан (без DEFAULT при ADD — иначе все старые строки стали бы черновиками)
+        try
+        {
+            await using var c8 = new NpgsqlCommand(@"
+ALTER TABLE plan_disciplines ADD COLUMN IF NOT EXISTS dept_request_status VARCHAR(30);
+ALTER TABLE plan_disciplines ADD COLUMN IF NOT EXISTS dept_message_to_op TEXT;
+ALTER TABLE plan_disciplines ADD COLUMN IF NOT EXISTS smartplan_id VARCHAR(200);
+UPDATE plan_disciplines
+SET dept_request_status = 'approved',
+    smartplan_id = COALESCE(NULLIF(TRIM(smartplan_id), ''), 'legacy-' || plan_discipline_id::text)
+WHERE dept_request_status IS NULL;
+ALTER TABLE plan_disciplines ALTER COLUMN dept_request_status SET DEFAULT 'draft';
+DO $$ BEGIN
+  ALTER TABLE plan_disciplines ALTER COLUMN dept_request_status SET NOT NULL;
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
+", conn);
+            await c8.ExecuteNonQueryAsync();
+        }
+        catch { }
+
+        // 9) Уникальность пары ФИО + департамент (одинаковые ФИО в разных департаментах разрешены)
+        try
+        {
+            await using var c9 = new NpgsqlCommand(@"
+CREATE UNIQUE INDEX IF NOT EXISTS uq_faculty_members_full_name_department
+  ON faculty_members (LOWER(TRIM(full_name)), COALESCE(department_id, -1));", conn);
+            await c9.ExecuteNonQueryAsync();
+        }
+        catch { /* возможны дубли в старых данных — устраните вручную и перезапустите */ }
+    }
+    catch { /* tables may not exist yet — run schema.sql first */ }
+}
+
+/// <summary>Есть ли уже преподаватель с тем же ФИО (без учёта регистра, trim) и тем же department_id (NULL считается одним «пустым» департаментом).</summary>
+static async Task<bool> FacultyNameDepartmentTaken(NpgsqlConnection conn, NpgsqlTransaction? tx, string fullName, int? departmentId, int? excludeFacultyId)
+{
+    await using var cmd = new NpgsqlCommand(@"
+SELECT 1 FROM faculty_members
+WHERE LOWER(TRIM(full_name)) = LOWER(TRIM(@name))
+  AND COALESCE(department_id, -1) = COALESCE(@deptId, -1)
+  AND (@excludeFacultyId IS NULL OR faculty_id <> @excludeFacultyId)
+LIMIT 1", conn, tx);
+    cmd.Parameters.AddWithValue("name", NpgsqlDbType.Text, fullName.Trim());
+    cmd.Parameters.AddWithValue("deptId", NpgsqlDbType.Integer, (object?)departmentId ?? DBNull.Value);
+    cmd.Parameters.AddWithValue("excludeFacultyId", NpgsqlDbType.Integer, (object?)excludeFacultyId ?? DBNull.Value);
+    return await cmd.ExecuteScalarAsync() != null;
 }
 
 static async Task<bool> HasAnyUser(NpgsqlDataSource ds)
@@ -1113,6 +1813,85 @@ app.MapPost("/logout", async (HttpContext ctx) =>
     await ctx.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
     return Results.Redirect("/login");
 });
+
+// ===== Смена пароля =====
+app.MapGet("/change-password", (HttpContext ctx, IAntiforgery antiforgery, string? first, string? weak, string? error, string? saved) =>
+{
+    if (ctx.User.Identity?.IsAuthenticated != true) return Results.Redirect("/login");
+    var isFirst = first == "1";
+    var isWeak  = weak == "1";
+    var msgHtml = "";
+    if (isFirst) msgHtml = "<p class='hint' style='margin-bottom:12px'>Добро пожаловать! Для продолжения работы установите новый пароль вместо стандартного.</p>";
+    else if (isWeak) msgHtml = "<p class='error' style='margin-bottom:12px'>Ваш пароль совпадает с паролем по умолчанию. Пожалуйста, смените его для обеспечения безопасности.</p>";
+    if (error == "mismatch") msgHtml += "<p class='error'>Пароли не совпадают.</p>";
+    else if (error == "short") msgHtml += "<p class='error'>Пароль должен содержать не менее 6 символов.</p>";
+    else if (error == "same") msgHtml += "<p class='error'>Новый пароль не должен совпадать с паролем по умолчанию (admin).</p>";
+    var okHtml = saved == "1" ? "<p class='hint' style='color:green'>Пароль успешно изменён.</p>" : "";
+    var tokens = antiforgery.GetAndStoreTokens(ctx);
+    var csrfField = $"<input type=\"hidden\" name=\"{tokens.FormFieldName}\" value=\"{ParseHelpers.H(tokens.RequestToken ?? "")}\"/>";
+    var html = $@"<!doctype html><html lang=""ru""><head><meta charset=""utf-8""><meta name=""viewport"" content=""width=device-width, initial-scale=1""><title>Смена пароля</title>
+  <link rel=""icon"" type=""image/png"" href=""/favicon.png?v=2"">
+  <link rel=""preconnect"" href=""https://fonts.googleapis.com"">
+  <link rel=""preconnect"" href=""https://fonts.gstatic.com"" crossorigin>
+  <link rel=""stylesheet"" href=""https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap"">
+  <link rel=""stylesheet"" href=""/css/hse.css?v=63""><link rel=""stylesheet"" href=""/css/site.css?v=63""></head><body>
+  <div class=""app app--centered""><main class=""main""><div class=""container"">
+  <section class=""card login-card"">
+    <div class=""login-brand""><img src=""/hse-logo.png"" alt=""ВШЭ"" class=""brand__logo brand__logo--login""></div>
+    <h1 class=""page-title"" style=""text-align:center;margin-bottom:4px"">Смена пароля</h1>
+    {msgHtml}{okHtml}
+    <form method=""post"" action=""/change-password"" class=""login-form"">
+      {csrfField}
+      <div class=""login-form__field"">
+        <label class=""label"">Новый пароль</label>
+        <input class=""input"" type=""password"" name=""newPassword"" required minlength=""6"" autofocus>
+      </div>
+      <div class=""login-form__field"">
+        <label class=""label"">Повторите пароль</label>
+        <input class=""input"" type=""password"" name=""confirmPassword"" required minlength=""6"">
+      </div>
+      <div class=""login-form__actions"">
+        <button class=""btn"" type=""submit"">Сохранить</button>
+        {(isFirst || isWeak ? "" : "<a class='btn btn--ghost' href='/uiworkload'>Отмена</a>")}
+      </div>
+    </form>
+  </section></div></main></div></body></html>";
+    return Results.Content(html, "text/html; charset=utf-8");
+});
+
+app.MapPost("/change-password", async (HttpContext ctx, NpgsqlDataSource ds, IFormCollection form) =>
+{
+    if (ctx.User.Identity?.IsAuthenticated != true) return Results.Redirect("/login");
+    var loginClaim = ctx.User.FindFirst("login")?.Value ?? ctx.User.Identity?.Name ?? "";
+    var newPassword = form["newPassword"].ToString() ?? "";
+    var confirmPassword = form["confirmPassword"].ToString() ?? "";
+    if (newPassword.Length < 6) return Results.Redirect("/change-password?error=short");
+    if (newPassword != confirmPassword) return Results.Redirect("/change-password?error=mismatch");
+    if (newPassword == "admin") return Results.Redirect("/change-password?error=same");
+    try
+    {
+        await using var conn = await ds.OpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand("SELECT user_id FROM app_users WHERE login = @login", conn);
+        cmd.Parameters.AddWithValue("login", NpgsqlDbType.Varchar, loginClaim);
+        var uid = await cmd.ExecuteScalarAsync();
+        if (uid is int userId)
+            await SetPassword(ds, userId, newPassword);
+        // Перевыпустить куки без флага must_change_password
+        var role = ctx.User.FindFirst(ClaimTypes.Role)?.Value ?? "User";
+        var newClaims = new List<Claim>
+        {
+            new(ClaimTypes.Name, loginClaim), new(ClaimTypes.Role, role), new("login", loginClaim)
+        };
+        await ctx.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme,
+            new ClaimsPrincipal(new ClaimsIdentity(newClaims, CookieAuthenticationDefaults.AuthenticationScheme)),
+            new Microsoft.AspNetCore.Authentication.AuthenticationProperties { IsPersistent = true });
+        return Results.Redirect("/uiworkload?passwordChanged=1");
+    }
+    catch (NpgsqlException)
+    {
+        return Results.Redirect("/change-password?error=db");
+    }
+}).RequireRateLimiting("auth");
 
 app.MapGet("/", async (HttpContext ctx, NpgsqlDataSource ds) =>
 {
@@ -1251,7 +2030,7 @@ GROUP BY wt.name", conn))
       .Append("<p class='hint'><a href='/uiplan' class='link'>Учебный план →</a> <a href='/uidisciplines' class='link'>Дисциплины →</a></p>")
       .Append("</section>");
 
-    return Results.Content(Layout("Главная", "dashboard", sb.ToString(), user.Login, user.IsAdmin), "text/html; charset=utf-8");
+    return Results.Content(Layout("Главная", "dashboard", sb.ToString(), user.Login, user.IsAdmin, user.CanReviewDisciplineRequests, GetCsrfToken(ctx)), "text/html; charset=utf-8");
 });
 
 app.MapGet("/uiworkload", async (
@@ -1316,6 +2095,8 @@ SELECT
   op_name,
   education_level,
   department_name,
+  streams_count,
+  groups_count,
   work_type,
   hours,
   faculty_name
@@ -1403,14 +2184,14 @@ LIMIT 500;
       .Append("<div class=\"toolbar\">");
     if (user.CanEditWorkload)
     {
-      sb.Append("<button class='btn' type='submit' form='wl-batch-form'>Сохранить все</button>")
-        .Append("<button class='btn btn--danger' type='button' data-delete-selected='wl'>Удалить выбранные</button>")
-        .Append("<button class='btn btn--ghost' type='button' data-wl-add>Добавить строку</button>");
+      sb.Append($"<button class='btn' type='submit' form='wl-batch-form'>{IconSave} Сохранить все</button>")
+        .Append($"<button class='btn btn--danger' type='button' data-delete-selected='wl'>{IconDelete} Удалить выбранные</button>")
+        .Append($"<button class='btn btn--ghost' type='button' data-wl-add>{IconAdd} Добавить строку</button>");
     }
     else
       sb.Append("<span class=\"hint\">Только просмотр. Редактирование: менеджер департамента или администратор.</span>");
-    sb.Append("<button class=\"btn btn--ghost\" type=\"button\" data-dialog-open=\"#workload-filter\">Фильтр</button>")
-      .Append("<button class=\"btn btn--ghost\" type=\"button\" onclick=\"window.location.href='/uiworkload'\">Сброс</button>");
+    sb.Append($"<button class=\"btn btn--ghost\" type=\"button\" data-dialog-open=\"#workload-filter\">{IconFilter} Фильтр</button>")
+      .Append($"<button class=\"btn btn--ghost\" type=\"button\" onclick=\"window.location.href='/uiworkload'\">{IconReset} Сброс</button>");
     var wlSortBase = "/uiworkload?" + (string.IsNullOrEmpty(redirectQuery) ? "" : redirectQuery + "&");
     sb.Append("<span class=\"toolbar-sort\"><label class=\"hint\" style=\"margin-right:6px\">Сортировка:</label>")
       .Append("<select class=\"input input--sm\" style=\"width:auto;display:inline-block\" onchange=\"window.location=this.value\" aria-label=\"Сортировка\">")
@@ -1427,7 +2208,7 @@ LIMIT 500;
     if (user.CanEditWorkload)
       sb.Append("<span class=\"toolbar-import\"><form method='post' action='/uiworkload/import' enctype='multipart/form-data'>")
         .Append("<input type='hidden' name='redirectQuery' value='").Append(ParseHelpers.H(redirectQuery)).Append("'>")
-        .Append("<label class='btn btn--ghost btn--file'><input type='file' name='file' accept='.xlsx,.xls' required>Выберите файл</label>")
+        .Append("<label class='btn btn--ghost btn--file'><input type='file' name='file' accept='.xlsx,.xls' required>").Append(IconImport).Append(" Выберите файл</label>")
         .Append("<button type='submit' class='btn btn--ghost'>Загрузить из Excel</button>")
         .Append("</form></span>");
     sb.Append("</div>")
@@ -1474,36 +2255,74 @@ LIMIT 500;
 
     sb.Append("<section class=\"card card--flush\">")
       .Append("<form id='wl-batch-form' method='post' action='/uiworkload/save-batch-form'>")
-      .Append("<datalist id='wl-faculty-list'>")
-      .Append(string.Join("", faculty.Select(f => $"<option value=\"{ParseHelpers.H(f.name)}\"></option>")))
-      .Append("</datalist>")
+      .Append("<select id='wl-faculty-options' class='input' style='display:none'>")
+      .Append("<option value=''>Преподаватель</option>")
+      .Append(string.Join("", faculty.Select(f => $"<option value=\"{f.id}\">{ParseHelpers.H(f.name)}</option>")))
+      .Append("</select>")
       .Append("<select id='wl-worktype-options' class='input' style='display:none'>")
       .Append(OptionsList(workTypes, null, "Вид работ"))
       .Append("</select>");
-    var allOps = OpMagistracy.Concat(OpBachelor).Distinct().OrderBy(x => x).ToArray();
+    var allOpsDb = new List<(string name, bool isCommercial)>();
+    try
+    {
+        await using (var opsCmd = new NpgsqlCommand("SELECT name, COALESCE(is_commercial, false) FROM educational_programs WHERE is_active = true ORDER BY name", conn))
+        await using (var opsR = await opsCmd.ExecuteReaderAsync())
+        {
+            while (await opsR.ReadAsync())
+                allOpsDb.Add((opsR.GetString(0), opsR.GetBoolean(1)));
+        }
+    }
+    catch
+    {
+        try
+        {
+            await using var opsCmd2 = new NpgsqlCommand("SELECT name FROM educational_programs WHERE is_active = true ORDER BY name", conn);
+            await using var opsR2 = await opsCmd2.ExecuteReaderAsync();
+            while (await opsR2.ReadAsync())
+                allOpsDb.Add((opsR2.GetString(0), false));
+        }
+        catch { }
+    }
+    var fallbackOps = OpMagistracy.Concat(OpBachelor).Distinct().OrderBy(x => x).ToArray();
+    var allOps = allOpsDb.Count > 0 ? allOpsDb.Select(o => o.name).Distinct().OrderBy(x => x).ToArray() : fallbackOps;
     var allDepartmentNames = departments.Select(d => d.name).OrderBy(x => x).ToArray();
     sb.Append("<select id='wl-year-options' class='input' style='display:none'>").Append(SelectOptions.AcademicYearOptions(null)).Append("</select>");
     sb.Append("<select id='wl-module-options' class='input' style='display:none'>").Append(WorkloadModuleSelect(null)).Append("</select>");
-    sb.Append("<select id='wl-op-options' class='input' style='display:none'>").Append(OptionsListStrings(allOps, null, "ОП")).Append("</select>");
+    var allOpsWithOther = allOps.Concat(new[] { "Другое" }).ToArray();
+    var allDeptNamesWithOther = allDepartmentNames.Concat(new[] { "Другое" }).ToArray();
+    sb.Append("<select id='wl-op-options' class='input' style='display:none'>").Append(OptionsListStrings(allOpsWithOther, null, "ОП")).Append("</select>");
     sb.Append("<select id='wl-level-options' class='input' style='display:none'>").Append(OptionsListStrings(SelectOptions.EducationLevels, null, "Уровень")).Append("</select>");
-    sb.Append("<select id='wl-dept-options' class='input' style='display:none'>").Append(OptionsListStrings(allDepartmentNames, null, "Департамент")).Append("</select>");
+    sb.Append("<select id='wl-dept-options' class='input' style='display:none'>").Append(OptionsListStrings(allDeptNamesWithOther, null, "Департамент")).Append("</select>");
+    var commercialJson = new StringBuilder("{");
+    var firstOpJson = true;
+    var commercialNames = allOpsDb.Count > 0 ? allOpsDb.Where(o => o.isCommercial).Select(o => o.name) : (IEnumerable<string>)OpBudgetHelper.CommercialOpNames;
+    foreach (var op in commercialNames)
+    {
+        if (!firstOpJson) commercialJson.Append(",");
+        commercialJson.Append("\"").Append(op.Replace("\"", "\\\"")).Append("\":true");
+        firstOpJson = false;
+    }
+    commercialJson.Append("}");
+    sb.Append("<script type=\"application/json\" id=\"wl-commercial-ops\">").Append(commercialJson).Append("</script>");
     var canEditWl = user.CanEditWorkload;
     sb.Append("<div class=\"table-scroll-top\"><div class=\"table-scroll-bar\" role=\"scrollbar\" aria-orientation=\"horizontal\"><div class=\"table-scroll-bar__inner\"></div></div><div class=\"table-wrap\"><table id=\"wl-table\" class=\"table\"><thead><tr>")
       .Append("<th><input type='checkbox' data-select-all='wl' aria-label='Выбрать все'").Append(canEditWl ? ">" : " disabled>").Append("</th>")
-      .Append("<th class=\"col-year\">Год</th>")
-      .Append("<th>Модуль</th>")
-      .Append("<th>№ дисциплины</th>")
-      .Append("<th>Дисциплина</th>")
-      .Append("<th>Образовательная программа</th>")
-      .Append("<th>Бюджет / Коммерческая</th>")
-      .Append("<th>Уровень образования</th>")
-      .Append("<th>Реализующий департамент</th>")
-      .Append("<th>Вид работ / Часы</th>")
-      .Append("<th>Нераспределённая нагрузка (ч)</th>")
-      .Append("<th>Преподаватель</th>")
+      .Append("<th class=\"col-year\">Год <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Модуль <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>№ дисциплины <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Дисциплина <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Образовательная программа <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Бюджет / Коммерческая <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Уровень образования <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Реализующий департамент <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Группы учебные <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Вид работ <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Часы <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Нераспределённая нагрузка (ч) <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Преподаватель <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
       .Append("</tr></thead><tbody>");
 
-    var rows = new List<(int assignmentId, int planDisciplineId, int facultyId, int workTypeId, string role, string year, int? modNo, string modName, string discNo, string discName, string opName, string level, string dept, decimal hours, string facultyName)>();
+    var rows = new List<(int assignmentId, int planDisciplineId, int facultyId, int workTypeId, string role, string year, int? modNo, string modName, string discNo, string discName, string opName, string level, string dept, int? groupsCount, decimal hours, string facultyName)>();
     await using (var r = await cmd.ExecuteReaderAsync())
     {
         while (await r.ReadAsync())
@@ -1524,13 +2343,16 @@ LIMIT 500;
                 var discNoVal = r.IsDBNull(8) ? "" : r.GetString(8);
                 var discNameVal = r.IsDBNull(9) ? "" : r.GetString(9);
                 var opVal = r.IsDBNull(10) ? "" : r.GetString(10);
+                // Запрос не включает op_id, поэтому: 11=education_level, 12=department_name,
+                // 13=streams_count, 14=groups_count, 15=work_type, 16=hours, 17=faculty_name
                 var levelVal = r.IsDBNull(11) ? "" : r.GetString(11);
                 var deptVal = r.IsDBNull(12) ? "" : r.GetString(12);
-                var hoursVal = r.IsDBNull(14) ? 0m : r.GetDecimal(14);
-                var facultyName = r.IsDBNull(15) ? "" : r.GetString(15);
-                rows.Add((assignmentIdDb, planDisciplineIdDb, facultyIdDb, workTypeIdDb, roleDb, yearVal, modNo, modName, discNoVal, discNameVal, opVal, levelVal, deptVal, hoursVal, facultyName));
+                int? groupsCnt = r.IsDBNull(14) ? null : Convert.ToInt32(r.GetValue(14));
+                var hoursVal = r.IsDBNull(16) ? 0m : r.GetDecimal(16);
+                var facultyName = r.IsDBNull(17) ? "" : r.GetString(17);
+                rows.Add((assignmentIdDb, planDisciplineIdDb, facultyIdDb, workTypeIdDb, roleDb, yearVal, modNo, modName, discNoVal, discNameVal, opVal, levelVal, deptVal, groupsCnt, hoursVal, facultyName));
             }
-            catch { /* пропуск строки с некорректными данными */ }
+            catch (Exception rowEx) { Console.WriteLine($"[WL-READ] Row error: {rowEx.Message}"); }
         }
     }
 
@@ -1562,84 +2384,80 @@ WHERE pd.plan_discipline_id = ANY(@ids)", conn);
         }
     }
 
-    var grouped = rows.GroupBy(x => x.assignmentId).ToList();
-    foreach (var grp in grouped)
+    foreach (var r in rows)
     {
-        var first = grp.First();
-        var rowKey = first.assignmentId.ToString();
-        var moduleSelected = first.modNo is >= 1 and <= 4 ? first.modNo : (int?)null;
-        var workTypeHoursList = grp.Select(x => (x.workTypeId, x.hours)).ToList();
-
-        var planTotalForRow = planTotalByPlanId.TryGetValue(first.planDisciplineId, out var pt) ? pt : 0m;
-        var initialAllocForRow = initialAllocatedByPlanId.TryGetValue(first.planDisciplineId, out var ia) ? ia : 0m;
-        sb.Append("<tr data-row-key=\"").Append(ParseHelpers.H(rowKey)).Append("\" data-plan-discipline-id=\"").Append(first.planDisciplineId).Append("\" data-plan-total=\"").Append(planTotalForRow.ToString(CultureInfo.InvariantCulture)).Append("\" data-initial-allocated=\"").Append(initialAllocForRow.ToString(CultureInfo.InvariantCulture)).Append("\">");
-        var assignmentIdForCheckbox = first.assignmentId;
+        var rowKey = r.assignmentId + "_" + r.workTypeId;
+        var moduleSelected = r.modNo is >= 1 and <= 4 ? r.modNo : (int?)null;
+        var planTotalForRow = planTotalByPlanId.TryGetValue(r.planDisciplineId, out var pt) ? pt : 0m;
+        var initialAllocForRow = initialAllocatedByPlanId.TryGetValue(r.planDisciplineId, out var ia) ? ia : 0m;
+        sb.Append("<tr data-row-key=\"").Append(ParseHelpers.H(rowKey)).Append("\" data-plan-discipline-id=\"").Append(r.planDisciplineId).Append("\" data-plan-total=\"").Append(planTotalForRow.ToString(CultureInfo.InvariantCulture)).Append("\" data-initial-allocated=\"").Append(initialAllocForRow.ToString(CultureInfo.InvariantCulture)).Append("\">");
         if (canEditWl)
-            sb.Append("<td><input type='checkbox' class='row-select row-select-wl' name='selectAssignmentId' value='").Append(assignmentIdForCheckbox).Append("'></td>");
+            sb.Append("<td><input type='checkbox' class='row-select row-select-wl' name='selectAssignmentId' value='").Append(r.assignmentId).Append("'></td>");
         else
             sb.Append("<td><input type='checkbox' class='row-select row-select-wl' disabled></td>");
         if (canEditWl)
-            sb.Append("<td class=\"col-year\"><select class=\"input\" name=\"year_").Append(rowKey).Append("\">").Append(SelectOptions.AcademicYearOptions(first.year)).Append("</select></td>")
+            sb.Append("<td class=\"col-year\"><select class=\"input\" name=\"year_").Append(rowKey).Append("\">").Append(SelectOptions.AcademicYearOptions(r.year)).Append("</select></td>")
               .Append("<td><select class=\"input\" name=\"module_").Append(rowKey).Append("\">").Append(WorkloadModuleSelect(moduleSelected)).Append("</select></td>")
-              .Append("<td><input class=\"input\" name=\"disciplineNo_").Append(rowKey).Append("\" value=\"").Append(ParseHelpers.H(first.discNo)).Append("\" pattern=\"[0-9]*\" title=\"Только цифры\"></td>")
-              .Append("<td><input class=\"input\" name=\"disciplineName_").Append(rowKey).Append("\" value=\"").Append(ParseHelpers.H(first.discName)).Append("\"></td>")
-              .Append("<td><select class=\"input\" name=\"opName_").Append(rowKey).Append("\">").Append(OptionsListStrings(allOps, first.opName, "ОП")).Append("</select></td>")
-              .Append("<td>").Append(ParseHelpers.H(OpBudgetHelper.OpBudgetCommercial(first.opName))).Append("</td>")
-              .Append("<td><select class=\"input\" name=\"educationLevel_").Append(rowKey).Append("\">").Append(OptionsListStrings(SelectOptions.EducationLevels, first.level, "Уровень")).Append("</select></td>")
-              .Append("<td><select class=\"input\" name=\"departmentName_").Append(rowKey).Append("\">").Append(OptionsListStrings(allDepartmentNames, first.dept, "Департамент")).Append("</select></td>");
+              .Append("<td><input class=\"input\" name=\"disciplineNo_").Append(rowKey).Append("\" value=\"").Append(ParseHelpers.H(r.discNo)).Append("\" pattern=\"[0-9]*\" title=\"Только цифры\"></td>")
+              .Append("<td><input class=\"input\" name=\"disciplineName_").Append(rowKey).Append("\" value=\"").Append(ParseHelpers.H(r.discName)).Append("\"></td>")
+              .Append("<td>")
+              .Append("<select class=\"input\" name=\"opName_").Append(rowKey).Append("\" data-другое-select>").Append(OptionsListStrings(allOpsWithOther, allOps.Contains(r.opName) ? r.opName : (string.IsNullOrWhiteSpace(r.opName) ? null : "Другое"), "ОП")).Append("</select>")
+              .Append("<input class=\"input input--другое-custom\" name=\"opNameCustom_").Append(rowKey).Append("\" value=\"").Append(ParseHelpers.H(!allOps.Contains(r.opName) && !string.IsNullOrWhiteSpace(r.opName) ? r.opName : "")).Append("\" placeholder=\"Название ОП\" style=\"").Append(!allOps.Contains(r.opName) && !string.IsNullOrWhiteSpace(r.opName) ? "" : "display:none").Append("\">")
+              .Append("</td>")
+              .Append("<td class=\"cell-budget\">").Append(ParseHelpers.H(OpBudgetHelper.OpBudgetCommercial(r.opName))).Append("</td>")
+              .Append("<td><select class=\"input\" name=\"educationLevel_").Append(rowKey).Append("\">").Append(OptionsListStrings(SelectOptions.EducationLevels, r.level, "Уровень")).Append("</select></td>")
+              .Append("<td>")
+              .Append("<select class=\"input\" name=\"departmentName_").Append(rowKey).Append("\" data-другое-select>").Append(OptionsListStrings(allDeptNamesWithOther, allDepartmentNames.Contains(r.dept) ? r.dept : (string.IsNullOrWhiteSpace(r.dept) ? null : "Другое"), "Департамент")).Append("</select>")
+              .Append("<input class=\"input input--другое-custom\" name=\"departmentNameCustom_").Append(rowKey).Append("\" value=\"").Append(ParseHelpers.H(!allDepartmentNames.Contains(r.dept) && !string.IsNullOrWhiteSpace(r.dept) ? r.dept : "")).Append("\" placeholder=\"Департамент\" style=\"").Append(!allDepartmentNames.Contains(r.dept) && !string.IsNullOrWhiteSpace(r.dept) ? "" : "display:none").Append("\">")
+              .Append("</td>")
+              .Append("<td class=\"cell-groups\"><span class=\"hint\" title=\"Из учебного плана; меняется в разделе «Учебный план»\">").Append(r.groupsCount is int g ? g.ToString(CultureInfo.InvariantCulture) : "—").Append("</span></td>");
         else
-            sb.Append("<td class=\"col-year\"><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(first.year)).Append("\" readonly></td>")
-              .Append("<td><input class=\"input input--readonly\" value=\"").Append(moduleSelected is >= 1 and <= 4 ? moduleSelected.Value + " модуль" : "1 модуль").Append("\" readonly></td>")
-              .Append("<td><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(first.discNo)).Append("\" readonly></td>")
-              .Append("<td><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(first.discName)).Append("\" readonly></td>")
-              .Append("<td><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(first.opName)).Append("\" readonly></td>")
-              .Append("<td>").Append(ParseHelpers.H(OpBudgetHelper.OpBudgetCommercial(first.opName))).Append("</td>")
-              .Append("<td><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(first.level)).Append("\" readonly></td>")
-              .Append("<td><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(first.dept)).Append("\" readonly></td>");
+            sb.Append("<td class=\"col-year\"><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(r.year)).Append("\" readonly></td>")
+              .Append("<td><input class=\"input input--readonly\" value=\"").Append(moduleSelected is >= 1 and <= 4 ? moduleSelected.Value + " модуль" : "").Append("\" readonly></td>")
+              .Append("<td><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(r.discNo)).Append("\" readonly></td>")
+              .Append("<td><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(r.discName)).Append("\" readonly></td>")
+              .Append("<td><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(r.opName)).Append("\" readonly></td>")
+              .Append("<td class=\"cell-budget\">").Append(ParseHelpers.H(OpBudgetHelper.OpBudgetCommercial(r.opName))).Append("</td>")
+              .Append("<td><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(r.level)).Append("\" readonly></td>")
+              .Append("<td><input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(r.dept)).Append("\" readonly></td>")
+              .Append("<td class=\"cell-groups\"><span class=\"hint\" title=\"Из учебного плана\">").Append(r.groupsCount is int g2 ? g2.ToString(CultureInfo.InvariantCulture) : "—").Append("</span></td>");
 
-        sb.Append("<td class=\"wl-cell-worktypes\">")
+        sb.Append("<td class=\"cell-work-type\">")
           .Append("<input type=\"hidden\" name=\"rowId\" value=\"").Append(rowKey).Append("\">")
-          .Append("<input type=\"hidden\" name=\"assignmentId_").Append(rowKey).Append("\" value=\"").Append(rowKey).Append("\">")
-          .Append("<input type=\"hidden\" class=\"input input--readonly\" name=\"planDisciplineId_").Append(rowKey).Append("\" value=\"").Append(first.planDisciplineId).Append("\">");
+          .Append("<input type=\"hidden\" name=\"assignmentId_").Append(rowKey).Append("\" value=\"").Append(r.assignmentId).Append("\">")
+          .Append("<input type=\"hidden\" name=\"planDisciplineId_").Append(rowKey).Append("\" value=\"").Append(r.planDisciplineId).Append("\">");
+        var wtName = workTypes.FirstOrDefault(w => w.id == r.workTypeId).name ?? "";
+        if (canEditWl)
+            sb.Append("<select class=\"input\" name=\"workTypeId_").Append(rowKey).Append("\">").Append(OptionsList(workTypes, r.workTypeId, "Вид работ")).Append("</select>");
+        else
+            sb.Append("<span class=\"input input--readonly cell-work-type__text\" title=\"").Append(ParseHelpers.H(wtName)).Append("\">").Append(ParseHelpers.H(wtName)).Append("</span>");
+        sb.Append("</td>");
+
+        sb.Append("<td>");
+        if (canEditWl)
+            sb.Append("<input class=\"input\" name=\"hours_").Append(rowKey).Append("\" value=\"").Append(r.hours.ToString(CultureInfo.InvariantCulture)).Append("\" placeholder=\"Часы\">");
+        else
+            sb.Append("<span class=\"input input--readonly\">").Append(r.hours.ToString(CultureInfo.InvariantCulture)).Append("</span>");
+        sb.Append("</td>");
+
+        var unallocatedVal = unallocatedByPlanId.TryGetValue(r.planDisciplineId, out var u) ? u : 0m;
+        sb.Append("<td class=\"cell-unallocated\">").Append(unallocatedVal.ToString("0.##", CultureInfo.InvariantCulture)).Append("</td><td>");
         if (canEditWl)
         {
-            sb.Append("<div class=\"wl-worktypes-list\">");
-            for (var i = 0; i < workTypeHoursList.Count; i++)
-            {
-                var (wtId, hrs) = workTypeHoursList[i];
-                sb.Append("<div class=\"wl-worktype-pair\">")
-                  .Append("<select class=\"input\" name=\"workTypeId_").Append(i).Append("_").Append(rowKey).Append("\">")
-                  .Append(OptionsList(workTypes, wtId, "Вид работ"))
-                  .Append("</select>")
-                  .Append("<input class=\"input\" name=\"hours_").Append(i).Append("_").Append(rowKey).Append("\" value=\"").Append(hrs.ToString(CultureInfo.InvariantCulture)).Append("\" placeholder=\"Часы\">")
-                  .Append("</div>");
-            }
-            sb.Append("</div>")
-              .Append("<button type=\"button\" class=\"btn btn--secondary btn--small wl-add-worktype\" data-row-key=\"").Append(ParseHelpers.H(rowKey)).Append("\">+ Вид работ</button>");
+            sb.Append("<select class=\"input\" name=\"facultyId_").Append(rowKey).Append("\" data-searchable>");
+            sb.Append("<option value=''>Преподаватель</option>");
+            foreach (var f in faculty)
+                sb.Append("<option value=\"").Append(f.id).Append("\"").Append(f.id == r.facultyId ? " selected" : "").Append(">").Append(ParseHelpers.H(f.name)).Append("</option>");
+            sb.Append("</select>");
         }
         else
-        {
-            foreach (var (wtId, hrs) in workTypeHoursList)
-            {
-                var wtName = workTypes.FirstOrDefault(w => w.id == wtId).name ?? "";
-                sb.Append("<div class=\"wl-worktype-pair\">")
-                  .Append("<span class=\"input input--readonly\">").Append(ParseHelpers.H(wtName)).Append("</span> ")
-                  .Append("<span class=\"input input--readonly\">").Append(hrs.ToString(CultureInfo.InvariantCulture)).Append(" ч.</span>")
-                  .Append("</div>");
-            }
-        }
-        var unallocatedVal = unallocatedByPlanId.TryGetValue(first.planDisciplineId, out var u) ? u : 0m;
-        sb.Append("</td><td class=\"cell-unallocated\">").Append(unallocatedVal.ToString("0.##", CultureInfo.InvariantCulture)).Append("</td><td>");
-        if (canEditWl)
-            sb.Append("<input class=\"input\" name=\"facultyName_").Append(rowKey).Append("\" list=\"wl-faculty-list\" value=\"").Append(ParseHelpers.H(first.facultyName)).Append("\" placeholder=\"Преподаватель\">");
-        else
-            sb.Append("<input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(first.facultyName)).Append("\" readonly>");
+            sb.Append("<input class=\"input input--readonly\" value=\"").Append(ParseHelpers.H(r.facultyName)).Append("\" readonly>");
         sb.Append("</td>");
         sb.Append("</tr>");
     }
 
     sb.Append("</tbody></table></div></div></form></section>");
-    return Results.Content(Layout("Нагрузка", "workload", sb.ToString(), user.Login, user.IsAdmin), "text/html; charset=utf-8");
+    return Results.Content(Layout("Нагрузка", "workload", sb.ToString(), user.Login, user.IsAdmin, user.CanReviewDisciplineRequests, GetCsrfToken(ctx)), "text/html; charset=utf-8");
 });
 
 app.MapPost("/uiworkload/delete", async (HttpContext ctx, NpgsqlDataSource ds, int? assignmentId) =>
@@ -1661,7 +2479,7 @@ app.MapPost("/uiworkload/delete", async (HttpContext ctx, NpgsqlDataSource ds, i
         await cmd2.ExecuteNonQueryAsync();
     }
     await tx.CommitAsync();
-    return Results.Redirect("/uiworkload");
+    return Results.Redirect("/uiworkload?deleted=1");
 });
 
 app.MapPost("/uiworkload/delete-batch", async (HttpContext ctx, NpgsqlDataSource ds, int[]? assignmentIds) =>
@@ -1688,7 +2506,7 @@ app.MapPost("/uiworkload/delete-batch", async (HttpContext ctx, NpgsqlDataSource
         }
     }
     await tx.CommitAsync();
-    return Results.Redirect("/uiworkload");
+    return Results.Redirect("/uiworkload?deleted=1");
 });
 
 app.MapGet("/uiworkload/export", async (
@@ -1777,6 +2595,7 @@ SELECT
   op_name,
   education_level,
   department_name,
+  groups_count,
   work_type,
   hours,
   faculty_name
@@ -1806,7 +2625,7 @@ ORDER BY op_name, course_no, discipline_no, discipline_name, work_type;
         var headers = new[]
         {
             "Год", "Модуль", "№ дисциплины", "Дисциплина", "Образовательная программа",
-            "Бюджет / Коммерческая", "Уровень образования", "Реализующий департамент", "Вид работ", "Часы",
+            "Бюджет / Коммерческая", "Уровень образования", "Реализующий департамент", "Группы учебные", "Вид работ", "Часы",
             "Нераспределённая нагрузка (ч)", "Преподаватель"
         };
         for (int i = 0; i < headers.Length; i++) ws.Cell(1, i + 1).Value = headers[i];
@@ -1830,11 +2649,12 @@ ORDER BY op_name, course_no, discipline_no, discipline_name, work_type;
                 ws.Cell(row, 6).Value = OpBudgetHelper.OpBudgetCommercial(rowOpName);
                 ws.Cell(row, 7).Value = r.IsDBNull(7) ? "" : r.GetString(7);
                 ws.Cell(row, 8).Value = r.IsDBNull(8) ? "" : r.GetString(8);
-                ws.Cell(row, 9).Value = r.IsDBNull(9) ? "" : r.GetString(9);
-                var hoursVal = r.IsDBNull(10) ? null : r.GetValue(10);
-                ws.Cell(row, 10).Value = hoursVal is null ? "" : (hoursVal is decimal d ? d : Convert.ToDecimal(hoursVal));
-                ws.Cell(row, 11).Value = unallocatedByPlanId.TryGetValue(planDiscId, out var u) ? u : 0m;
-                ws.Cell(row, 12).Value = r.IsDBNull(11) ? "" : r.GetString(11);
+                ws.Cell(row, 9).Value = r.IsDBNull(9) ? "" : Convert.ToString(r.GetValue(9));
+                ws.Cell(row, 10).Value = r.IsDBNull(10) ? "" : r.GetString(10);
+                var hoursVal = r.IsDBNull(11) ? null : r.GetValue(11);
+                ws.Cell(row, 11).Value = hoursVal is null ? "" : (hoursVal is decimal d ? d : Convert.ToDecimal(hoursVal));
+                ws.Cell(row, 12).Value = unallocatedByPlanId.TryGetValue(planDiscId, out var u) ? u : 0m;
+                ws.Cell(row, 13).Value = r.IsDBNull(12) ? "" : r.GetString(12);
                 row++;
             }
         }
@@ -1938,18 +2758,46 @@ app.MapPost("/uiworkload/import", async (HttpContext ctx, NpgsqlDataSource ds, H
             errors.Add($"Не найдена дисциплина: {yearVal} / {disciplineName}. Добавьте в Учебный план (год {yearAlt}).");
             continue;
         }
+        int? facultyDeptId = null;
+        if (!string.IsNullOrWhiteSpace(departmentName))
+        {
+            await using var dSel = new NpgsqlCommand("SELECT department_id FROM departments WHERE name = @name LIMIT 1", conn, tx);
+            dSel.Parameters.AddWithValue("name", NpgsqlDbType.Text, departmentName.Trim());
+            var dObj = await dSel.ExecuteScalarAsync();
+            if (dObj is int did) facultyDeptId = did;
+        }
+        if (facultyDeptId is null)
+        {
+            await using var pdDept = new NpgsqlCommand(
+                "SELECT implementing_department_id FROM plan_disciplines WHERE plan_discipline_id = @id", conn, tx);
+            pdDept.Parameters.AddWithValue("id", NpgsqlDbType.Integer, planDisciplineId.Value);
+            var impl = await pdDept.ExecuteScalarAsync();
+            if (impl is int iid) facultyDeptId = iid;
+        }
+        if (facultyDeptId is null)
+        {
+            errors.Add($"Преподаватель «{facultyName}»: укажите в файле колонку «Реализующий департамент» / «Департамент» или задайте департамент у дисциплины в учебном плане (одноимённых ППС без департамента различить нельзя).");
+            continue;
+        }
         int? facultyId = null;
-        await using (var fc = new NpgsqlCommand("SELECT faculty_id FROM faculty_members WHERE LOWER(TRIM(full_name)) = LOWER(TRIM(@name)) LIMIT 1", conn, tx))
+        await using (var fc = new NpgsqlCommand(@"
+SELECT faculty_id FROM faculty_members
+WHERE LOWER(TRIM(full_name)) = LOWER(TRIM(@name))
+  AND COALESCE(department_id, -1) = COALESCE(@deptId, -1)
+LIMIT 1", conn, tx))
         {
             fc.Parameters.AddWithValue("name", NpgsqlDbType.Text, facultyName);
+            fc.Parameters.AddWithValue("deptId", NpgsqlDbType.Integer, facultyDeptId.Value);
             var fid = await fc.ExecuteScalarAsync();
             if (fid is int fi) facultyId = fi;
         }
         if (facultyId is null)
         {
-            await using (var insF = new NpgsqlCommand("INSERT INTO faculty_members (full_name) VALUES (@name) RETURNING faculty_id", conn, tx))
+            await using (var insF = new NpgsqlCommand(
+                "INSERT INTO faculty_members (full_name, department_id) VALUES (@name, @deptId) RETURNING faculty_id", conn, tx))
             {
                 insF.Parameters.AddWithValue("name", NpgsqlDbType.Text, facultyName.Trim());
+                insF.Parameters.AddWithValue("deptId", NpgsqlDbType.Integer, facultyDeptId.Value);
                 var newId = await insF.ExecuteScalarAsync();
                 if (newId is int nid) facultyId = nid;
             }
@@ -2093,13 +2941,13 @@ app.MapPost("/uiworkload/save-batch-form", async (HttpContext ctx, NpgsqlDataSou
 
         var assignmentId = ParseHelpers.IntOrNull(Get("assignmentId"));
         var planDisciplineId = ParseHelpers.IntOrNull(Get("planDisciplineId"));
-        var facultyName = Get("facultyName");
+        var facultyId = ParseHelpers.IntOrNull(Get("facultyId"));
         var role = Get("role");
         var roleForDb = string.IsNullOrWhiteSpace(role) ? "Преподаватель" : role.Trim();
 
         if (planDisciplineId is null && assignmentId is null) continue;
 
-        if (string.IsNullOrWhiteSpace(facultyName))
+        if (facultyId is null)
         {
             errors.Add($"Укажите преподавателя (строка {rowKeyStr})");
             continue;
@@ -2107,21 +2955,6 @@ app.MapPost("/uiworkload/save-batch-form", async (HttpContext ctx, NpgsqlDataSou
         if (assignmentId is null && planDisciplineId is null)
         {
             errors.Add($"Укажите ID дисциплины для новой строки (строка {rowKeyStr})");
-            continue;
-        }
-
-        int? facultyId;
-        await using (var fcmd = new NpgsqlCommand(
-            "SELECT faculty_id FROM faculty_members WHERE full_name = @name",
-            conn, tx))
-        {
-            fcmd.Parameters.AddWithValue("name", NpgsqlDbType.Text, facultyName);
-            var found = await fcmd.ExecuteScalarAsync();
-            facultyId = found as int?;
-        }
-        if (facultyId is null)
-        {
-            errors.Add($"Преподаватель не найден: {facultyName} (строка {rowKeyStr})");
             continue;
         }
 
@@ -2149,6 +2982,101 @@ WHERE assignment_id = @assignmentId;", conn, tx);
             updateAssign.Parameters.AddWithValue("role", NpgsqlDbType.Text, (object?)role ?? DBNull.Value);
             updateAssign.Parameters.AddWithValue("assignmentId", NpgsqlDbType.Integer, assignmentIdValue);
             await updateAssign.ExecuteNonQueryAsync();
+        }
+
+        var yearVal = Get("year");
+        var disciplineNoVal = Get("disciplineNo");
+        var disciplineNameVal = Get("disciplineName");
+        var opNameRaw = Get("opName");
+        var opNameVal = opNameRaw == "Другое" ? (Get("opNameCustom") is string oc && !string.IsNullOrWhiteSpace(oc) ? oc.Trim() : null) : opNameRaw;
+        var educationLevelVal = Get("educationLevel");
+        var departmentNameRaw = Get("departmentName");
+        var departmentNameVal = departmentNameRaw == "Другое" ? (Get("departmentNameCustom") is string dc && !string.IsNullOrWhiteSpace(dc) ? dc.Trim() : null) : departmentNameRaw;
+
+        if (planDisciplineId.HasValue)
+        {
+            if (!string.IsNullOrWhiteSpace(disciplineNoVal) || !string.IsNullOrWhiteSpace(disciplineNameVal) || !string.IsNullOrWhiteSpace(departmentNameVal))
+            {
+                int? deptId = null;
+                if (!string.IsNullOrWhiteSpace(departmentNameVal))
+                {
+                    await using var deptSel = new NpgsqlCommand("SELECT department_id FROM departments WHERE name = @name LIMIT 1", conn, tx);
+                    deptSel.Parameters.AddWithValue("name", NpgsqlDbType.Text, departmentNameVal);
+                    var deptObj = await deptSel.ExecuteScalarAsync();
+                    if (deptObj is int foundId)
+                    {
+                        deptId = foundId;
+                    }
+                    else if (departmentNameRaw == "Другое")
+                    {
+                        await using var deptIns = new NpgsqlCommand("INSERT INTO departments (name) VALUES (@name) RETURNING department_id", conn, tx);
+                        deptIns.Parameters.AddWithValue("name", NpgsqlDbType.Text, departmentNameVal);
+                        deptId = await deptIns.ExecuteScalarAsync() as int?;
+                    }
+                }
+                await using var updDisc = new NpgsqlCommand(@"
+UPDATE plan_disciplines
+SET discipline_no = COALESCE(@discNo, discipline_no),
+    discipline_name = COALESCE(@discName, discipline_name),
+    implementing_department_id = COALESCE(@deptId, implementing_department_id)
+WHERE plan_discipline_id = @pdId", conn, tx);
+                updDisc.Parameters.AddWithValue("discNo", NpgsqlDbType.Text, (object?)disciplineNoVal ?? DBNull.Value);
+                updDisc.Parameters.AddWithValue("discName", NpgsqlDbType.Text, (object?)disciplineNameVal ?? DBNull.Value);
+                updDisc.Parameters.AddWithValue("deptId", NpgsqlDbType.Integer, (object?)deptId ?? DBNull.Value);
+                updDisc.Parameters.AddWithValue("pdId", NpgsqlDbType.Integer, planDisciplineId.Value);
+                await updDisc.ExecuteNonQueryAsync();
+            }
+
+            if (!string.IsNullOrWhiteSpace(yearVal))
+            {
+                await using var updYear = new NpgsqlCommand(@"
+UPDATE study_plans SET academic_year = @year
+WHERE plan_id = (SELECT plan_id FROM plan_disciplines WHERE plan_discipline_id = @pdId)
+  AND (academic_year IS NULL OR academic_year <> @year)", conn, tx);
+                updYear.Parameters.AddWithValue("year", NpgsqlDbType.Text, yearVal);
+                updYear.Parameters.AddWithValue("pdId", NpgsqlDbType.Integer, planDisciplineId.Value);
+                await updYear.ExecuteNonQueryAsync();
+            }
+
+            if (!string.IsNullOrWhiteSpace(opNameVal))
+            {
+                await using var opCmd = new NpgsqlCommand(@"
+SELECT pp.plan_program_id FROM plan_programs pp
+JOIN educational_programs ep ON ep.op_id = pp.op_id
+WHERE pp.plan_id = (SELECT plan_id FROM plan_disciplines WHERE plan_discipline_id = @pdId)
+  AND ep.name = @opName LIMIT 1", conn, tx);
+                opCmd.Parameters.AddWithValue("pdId", NpgsqlDbType.Integer, planDisciplineId.Value);
+                opCmd.Parameters.AddWithValue("opName", NpgsqlDbType.Text, opNameVal);
+                var ppObj = await opCmd.ExecuteScalarAsync();
+                if (ppObj is int ppId)
+                {
+                    await using var checkLink = new NpgsqlCommand(
+                        "SELECT 1 FROM plan_discipline_programs WHERE plan_discipline_id = @pdId AND plan_program_id = @ppId", conn, tx);
+                    checkLink.Parameters.AddWithValue("pdId", NpgsqlDbType.Integer, planDisciplineId.Value);
+                    checkLink.Parameters.AddWithValue("ppId", NpgsqlDbType.Integer, ppId);
+                    var alreadyLinked = await checkLink.ExecuteScalarAsync();
+                    if (alreadyLinked is null)
+                    {
+                        await using var delLink = new NpgsqlCommand("DELETE FROM plan_discipline_programs WHERE plan_discipline_id = @pdId", conn, tx);
+                        delLink.Parameters.AddWithValue("pdId", NpgsqlDbType.Integer, planDisciplineId.Value);
+                        await delLink.ExecuteNonQueryAsync();
+                        await using var insLink = new NpgsqlCommand("INSERT INTO plan_discipline_programs (plan_discipline_id, plan_program_id) VALUES (@pdId, @ppId) ON CONFLICT DO NOTHING", conn, tx);
+                        insLink.Parameters.AddWithValue("pdId", NpgsqlDbType.Integer, planDisciplineId.Value);
+                        insLink.Parameters.AddWithValue("ppId", NpgsqlDbType.Integer, ppId);
+                        await insLink.ExecuteNonQueryAsync();
+                    }
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(educationLevelVal) && !string.IsNullOrWhiteSpace(opNameVal))
+            {
+                await using var updLvl = new NpgsqlCommand(@"
+UPDATE educational_programs SET education_level = @lvl
+WHERE name = @opName AND (education_level IS NULL OR education_level <> @lvl)", conn, tx);
+                updLvl.Parameters.AddWithValue("lvl", NpgsqlDbType.Text, educationLevelVal);
+                updLvl.Parameters.AddWithValue("opName", NpgsqlDbType.Text, opNameVal);
+                await updLvl.ExecuteNonQueryAsync();
+            }
         }
 
         var moduleNo = ParseHelpers.IntOrNull(Get("module"));
@@ -2181,53 +3109,32 @@ WHERE assignment_id = @assignmentId;", conn, tx);
             }
         }
 
-        var submittedWorkTypeIds = new List<int>();
-        for (var i = 0; i < 50; i++)
+        var workTypeId = ParseHelpers.IntOrNull(Get("workTypeId"));
+        var hours = ParseHelpers.DecimalOrNull(Get("hours"));
+        if (workTypeId is null)
         {
-            var workTypeId = ParseHelpers.IntOrNull(GetIndexed("workTypeId", i));
-            var hours = ParseHelpers.DecimalOrNull(GetIndexed("hours", i));
-            if (workTypeId is null && hours is null) continue;
-            if (workTypeId is null)
-            {
-                errors.Add($"Выберите вид работ (строка {rowKeyStr}, позиция {i + 1})");
-                continue;
-            }
-            if (hours is null)
-            {
-                errors.Add($"Укажите часы (строка {rowKeyStr}, вид работ {i + 1})");
-                continue;
-            }
-            if (hours < 0)
-            {
-                errors.Add($"Часы не могут быть отрицательными (строка {rowKeyStr})");
-                continue;
-            }
-            submittedWorkTypeIds.Add(workTypeId.Value);
-            await using var upsertHours = new NpgsqlCommand(@"
+            errors.Add($"Выберите вид работ (строка {rowKeyStr})");
+            continue;
+        }
+        if (hours is null)
+        {
+            errors.Add($"Укажите часы (строка {rowKeyStr})");
+            continue;
+        }
+        if (hours < 0)
+        {
+            errors.Add($"Часы не могут быть отрицательными (строка {rowKeyStr})");
+            continue;
+        }
+        await using var upsertHours = new NpgsqlCommand(@"
 INSERT INTO assignment_hours (assignment_id, work_type_id, hours)
 VALUES (@assignmentId, @workTypeId, @hours)
 ON CONFLICT (assignment_id, work_type_id) DO UPDATE
 SET hours = EXCLUDED.hours;", conn, tx);
-            upsertHours.Parameters.AddWithValue("assignmentId", NpgsqlDbType.Integer, assignmentIdValue);
-            upsertHours.Parameters.AddWithValue("workTypeId", NpgsqlDbType.Integer, workTypeId.Value);
-            upsertHours.Parameters.AddWithValue("hours", NpgsqlDbType.Numeric, hours.Value);
-            await upsertHours.ExecuteNonQueryAsync();
-        }
-
-        if (submittedWorkTypeIds.Count == 0)
-        {
-            errors.Add($"Укажите хотя бы один вид работ и часы (строка {rowKeyStr})");
-            continue;
-        }
-
-        await using (var delCmd = new NpgsqlCommand(@"
-DELETE FROM assignment_hours
-WHERE assignment_id = @aid AND work_type_id <> ALL(@keepIds);", conn, tx))
-        {
-            delCmd.Parameters.AddWithValue("aid", NpgsqlDbType.Integer, assignmentIdValue);
-            delCmd.Parameters.AddWithValue("keepIds", NpgsqlDbType.Array | NpgsqlDbType.Integer, submittedWorkTypeIds.ToArray());
-            await delCmd.ExecuteNonQueryAsync();
-        }
+        upsertHours.Parameters.AddWithValue("assignmentId", NpgsqlDbType.Integer, assignmentIdValue);
+        upsertHours.Parameters.AddWithValue("workTypeId", NpgsqlDbType.Integer, workTypeId.Value);
+        upsertHours.Parameters.AddWithValue("hours", NpgsqlDbType.Numeric, hours.Value);
+        await upsertHours.ExecuteNonQueryAsync();
         touchedAssignmentIds.Add(assignmentIdValue);
     }
 
@@ -2238,22 +3145,25 @@ WHERE assignment_id = @aid AND work_type_id <> ALL(@keepIds);", conn, tx))
         var body = "<section class='card'><h2>Ошибки при сохранении</h2><p class='error'>"
             + ParseHelpers.H(msg).Replace("\n", "<br>")
             + "</p><p><a href='/uiworkload' class='btn'>Вернуться к таблице нагрузки</a></p></section>";
-        var html = Layout("Ошибки сохранения", "workload", body, user.Login, user.IsAdmin);
+        var html = Layout("Ошибки сохранения", "workload", body, user.Login, user.IsAdmin, user.CanReviewDisciplineRequests);
         return Results.Content(html, "text/html; charset=utf-8");
     }
 
     await tx.CommitAsync();
-    return Results.Redirect("/uiworkload");
+    return Results.Redirect("/uiworkload?saved=1");
 }).DisableAntiforgery();
 
-app.MapPost("/uiworkload/seed-ops", async (NpgsqlDataSource ds) =>
+app.MapPost("/uiworkload/seed-ops", async (HttpContext ctx, NpgsqlDataSource ds) =>
 {
+    var user = await GetCurrentUser(ds, ctx.User);
+    if (user is null) return Results.Unauthorized();
+    if (!user.IsAdmin) return Results.Forbid();
     var opList = OpMagistracy.Concat(OpBachelor).Distinct();
     var (created, error) = await SeedOpsAsync(ds, opList);
     if (!string.IsNullOrWhiteSpace(error))
         return Results.BadRequest(error);
     return Results.Ok(new { created });
-});
+}).DisableAntiforgery();
 
 app.MapGet("/uiplan", async (HttpContext ctx, NpgsqlDataSource ds, string? year, string[]? opName, string? courseNo, string[]? departmentId, string[]? moduleNo, string? sortBy, string? sortOrder, string? importError) =>
 {
@@ -2261,13 +3171,29 @@ app.MapGet("/uiplan", async (HttpContext ctx, NpgsqlDataSource ds, string? year,
     if (user is null) return Results.Redirect("/login");
     var redirectQuery = ctx.Request.QueryString.Value?.TrimStart('?') ?? "";
     var opNames = (opName ?? Array.Empty<string>()).Where(s => !string.IsNullOrWhiteSpace(s)).ToArray();
-    var opNamesLike = opNames.Length == 0 ? null : opNames.Select(n => $"%{n}%").ToArray();
+    // Ограничение по доступным ОП для не-администраторов
+    if (!user.IsAdmin && user.AllowedOpNames.Length > 0)
+    {
+        var allowedSet = new HashSet<string>(user.AllowedOpNames, StringComparer.OrdinalIgnoreCase);
+        opNames = opNames.Length == 0 ? user.AllowedOpNames : opNames.Where(o => allowedSet.Contains(o)).ToArray();
+    }
+    string[]? opNamesLike;
+    if (!user.IsAdmin && user.AllowedOpNames.Length == 0 && !user.CanEditPlan)
+        opNamesLike = new[] { "%\u0000%" }; // нет доступных ОП → ничего не показываем
+    else
+        opNamesLike = opNames.Length == 0 ? null : opNames.Select(n => $"%{n}%").ToArray();
     var opNamesNormalized = opNames.Select(ParseHelpers.NormalizeOpName).ToArray();
     var opNorms = opNamesNormalized.Length == 0 ? null : opNamesNormalized;
     var courseNoValue = ParseHelpers.IntOrNull(courseNo);
     var moduleNos = ParseModuleNos(moduleNo);
     var departments = await LoadDepartments(ds);
     var departmentIds = ParseDepartmentIds(departmentId);
+    // Ограничение по доступным департаментам для не-администраторов
+    if (!user.IsAdmin && user.AllowedDepartmentIds.Length > 0)
+    {
+        var allowedDept = new HashSet<int>(user.AllowedDepartmentIds);
+        departmentIds = departmentIds.Length == 0 ? user.AllowedDepartmentIds : departmentIds.Where(d => allowedDept.Contains(d)).ToArray();
+    }
     var departmentNames = departmentIds.Length == 0 ? null : departments.Where(d => departmentIds.Contains(d.id)).Select(d => d.name).ToArray();
     var yearValue = string.IsNullOrWhiteSpace(year) ? null : year;
     var opQuery = opNames.Length == 0
@@ -2285,7 +3211,7 @@ app.MapGet("/uiplan", async (HttpContext ctx, NpgsqlDataSource ds, string? year,
     body.Append("<section class='page-header'>")
         .Append("<div>")
         .Append("<h1 class='page-title'>Учебный план</h1>")
-        .Append("<div class='page-subtitle'>Просмотр учебного плана по выбранным ОП</div>")
+        .Append("<div class='page-subtitle'>Просмотр и редактирование по ОП. Новые дисциплины — черновик: укажите реализующий департамент и нажмите «Отправить в департамент». После согласования и внесения в Смартплан дисциплина появится во вкладке «Дисциплины».</div>")
         .Append("</div>")
         .Append("</section>");
     if (!string.IsNullOrEmpty(importError))
@@ -2296,17 +3222,18 @@ app.MapGet("/uiplan", async (HttpContext ctx, NpgsqlDataSource ds, string? year,
         .Append("<div class=\"toolbar\">");
     if (user.CanEditPlan)
     {
-        body.Append("<button class=\"btn\" type=\"submit\" form=\"plan-batch-form\">Сохранить все</button>")
-            .Append("<button class=\"btn btn--danger\" type=\"button\" data-delete-selected=\"plan\">Удалить выбранные</button>")
-            .Append("<button class=\"btn btn--ghost\" type=\"button\" data-plan-add>Добавить строку</button>");
+        body.Append($"<button class=\"btn\" type=\"button\" data-plan-save-all>{IconSave} Сохранить все</button>")
+            .Append($"<button class=\"btn btn--danger\" type=\"button\" data-delete-selected=\"plan\">{IconDelete} Удалить выбранные</button>")
+            .Append($"<button class=\"btn btn--ghost\" type=\"button\" data-plan-add>{IconAdd} Добавить строку</button>")
+            .Append($"<form method=\"post\" action=\"/uiplan/accept-all\" style=\"display:inline\">")
+            .Append($"<input type=\"hidden\" name=\"redirectQuery\" value=\"{ParseHelpers.H(redirectQuery)}\">")
+            .Append($"<button type=\"submit\" class=\"btn btn--ghost\" onclick=\"return confirm('Пометить все дисциплины текущего фильтра как Принято АРом?')\">✓ Принять весь план</button>")
+            .Append($"</form>");
     }
     else
         body.Append("<span class=\"hint\">Только просмотр. Редактирование: академический руководитель или администратор.</span>");
-    body.Append("<button class=\"btn btn--ghost\" type=\"button\" data-dialog-open=\"#plan-filter\">Фильтр</button>")
-        .Append("<button class=\"btn btn--ghost\" type=\"button\" onclick=\"window.location.href='/uiplan'\">Сброс</button>");
     var planSortBase = "/uiplan?" + (string.IsNullOrEmpty(redirectQuery) ? "" : redirectQuery + "&");
-    body.Append("<span class=\"toolbar-sort\"><label class=\"hint\" style=\"margin-right:6px\">Сортировка:</label>")
-        .Append("<select class=\"input input--sm\" style=\"width:auto;display:inline-block\" onchange=\"window.location=this.value\" aria-label=\"Сортировка\">")
+    body.Append("<span class=\"toolbar-sort\"><select class=\"input input--sm\" style=\"width:auto;display:inline-block\" onchange=\"window.location=this.value\" aria-label=\"Сортировка\">")
         .Append("<option value=\"").Append(planSortBase).Append("sortBy=name&sortOrder=asc\"").Append((sortBy ?? "name") == "name" && sortOrder != "desc" ? " selected" : "").Append(">По названию А–Я</option>")
         .Append("<option value=\"").Append(planSortBase).Append("sortBy=name&sortOrder=desc\"").Append((sortBy ?? "") == "name" && sortOrder == "desc" ? " selected" : "").Append(">По названию Я–А</option>")
         .Append("<option value=\"").Append(planSortBase).Append("sortBy=no&sortOrder=asc\"").Append(sortBy == "no" ? " selected" : "").Append(">По № дисциплины</option>")
@@ -2322,28 +3249,35 @@ app.MapGet("/uiplan", async (HttpContext ctx, NpgsqlDataSource ds, string? year,
     if (user.CanEditPlan)
         body.Append("<span class=\"toolbar-import\"><form method='post' action='/uiplan/import' enctype='multipart/form-data'>")
             .Append("<input type='hidden' name='redirectQuery' value='").Append(ParseHelpers.H(redirectQuery)).Append("'>")
-            .Append("<label class='btn btn--ghost btn--file'><input type='file' name='file' accept='.xlsx,.xls' required>Выберите файл</label>")
+            .Append("<label class='btn btn--ghost btn--file'><input type='file' name='file' accept='.xlsx,.xls' required>").Append(IconImport).Append(" Выберите файл</label>")
             .Append("<button type='submit' class='btn btn--ghost'>Загрузить из Excel</button>")
             .Append("</form></span>");
     body.Append("</div>")
-        .Append("<div class=\"hint\">Показано до 500 строк</div>")
-        .Append("</section>")
-        .Append("<dialog class=\"modal\" id=\"plan-filter\">")
-        .Append("<form method=\"get\" action=\"/uiplan\" class=\"form form--row\">")
-        .Append("<div class=\"input-group\"><label class=\"input-group__label\">Учебный год</label>")
-        .Append("<select class=\"input\" name=\"year\">").Append(SelectOptions.AcademicYearOptions(year)).Append("</select></div>")
-        .Append(RenderOpCheckboxes(opNames, null))
-        .Append(RenderDepartmentCheckboxes(departments, departmentIds, null))
-        .Append(RenderModuleCheckboxes(moduleNos))
-        .Append("<input class=\"input\" type=\"number\" name=\"courseNo\" placeholder=\"Курс\" value=\"").Append(courseNoValue?.ToString() ?? "").Append("\">")
+        .Append("<form method=\"get\" action=\"/uiplan\" class=\"plan-filter-bar filter-bar\">")
+        .Append("<select class=\"input input--filter\" name=\"year\" onchange=\"this.form.submit()\">").Append(SelectOptions.AcademicYearOptions(year)).Append("</select>");
+    var allOpNamesForFilter = OpMagistracy.Concat(OpBachelor).Distinct().OrderBy(x => x).ToArray();
+    body.Append("<select class=\"input input--filter\" name=\"opName\" onchange=\"this.form.submit()\">")
+        .Append("<option value=\"\">Все ОП</option>");
+    foreach (var op in allOpNamesForFilter)
+        body.Append("<option value=\"").Append(ParseHelpers.H(op)).Append("\"").Append(opNames.Contains(op, StringComparer.OrdinalIgnoreCase) ? " selected" : "").Append(">").Append(ParseHelpers.H(op)).Append("</option>");
+    body.Append("</select>")
+        .Append("<select class=\"input input--filter\" name=\"moduleNo\" onchange=\"this.form.submit()\">")
+        .Append("<option value=\"\">Все модули</option>");
+    for (var m = 1; m <= 4; m++)
+        body.Append("<option value=\"").Append(m).Append("\"").Append(moduleNos.Contains(m) ? " selected" : "").Append(">").Append(m).Append(" модуль</option>");
+    body.Append("</select>")
+        .Append("<select class=\"input input--filter\" name=\"departmentId\" onchange=\"this.form.submit()\">")
+        .Append("<option value=\"\">Все департаменты</option>");
+    foreach (var d in departments)
+        body.Append("<option value=\"").Append(d.id).Append("\"").Append(departmentIds.Contains(d.id) ? " selected" : "").Append(">").Append(ParseHelpers.H(d.name)).Append("</option>");
+    body.Append("</select>")
+        .Append("<input class=\"input input--filter\" type=\"number\" name=\"courseNo\" placeholder=\"Курс\" value=\"").Append(courseNoValue?.ToString() ?? "").Append("\" style=\"width:70px\" onchange=\"this.form.submit()\">")
         .Append("<input type='hidden' name='sortBy' value='").Append(ParseHelpers.H(sortBy ?? "name")).Append("'>")
         .Append("<input type='hidden' name='sortOrder' value='").Append(ParseHelpers.H(sortOrder ?? "asc")).Append("'>")
-        .Append("<div class=\"modal__actions\">")
-        .Append("<button class=\"btn\" type=\"submit\">Применить</button>")
-        .Append("<button class=\"btn btn--ghost\" type=\"button\" data-dialog-close>Закрыть</button>")
-        .Append("</div>")
+        .Append($"<button class=\"btn btn--ghost btn--sm\" type=\"button\" onclick=\"window.location.href='/uiplan'\">{IconReset} Сброс</button>")
         .Append("</form>")
-        .Append("</dialog>");
+        .Append("<div class=\"hint\">Показано до 500 строк</div>")
+        .Append("</section>");
 
     try
     {
@@ -2379,7 +3313,7 @@ WHERE name ILIKE ANY(@opNames);", conn);
     var opIdsParam = opIds.Count == 0 ? new[] { -1 } : opIds.ToArray();
 
     await using (var planFilterCmd = new NpgsqlCommand(@"
-SELECT COUNT(*)
+SELECT COUNT(DISTINCT pd.plan_discipline_id)
 FROM plan_disciplines pd
 JOIN plan_discipline_programs pdp ON pd.plan_discipline_id = pdp.plan_discipline_id
 JOIN plan_programs pp ON pdp.plan_program_id = pp.plan_program_id
@@ -2542,20 +3476,20 @@ GROUP BY op_name;", conn))
         ? @"
 SELECT
   NULL::int AS id,
-  op_name AS ops,
-  education_level,
+  v.op_name AS ops,
+  v.education_level,
   ''::text AS direction,
   ''::text AS funding_type,
-  module_name,
+  v.module_name,
   ''::text AS module_subtype,
-  discipline_no,
-  discipline_name,
-  department_name AS implementing_department,
+  v.discipline_no,
+  v.discipline_name,
+  v.department_name AS implementing_department,
   ''::text AS implementing_dep_parent,
   ''::text AS discipline_kind,
   NULL::boolean AS is_key_seminar,
   NULL::boolean AS has_online_course,
-  course_no,
+  v.course_no,
   NULL::boolean AS has_mu_request,
   ''::text AS language,
   ''::text AS mkd,
@@ -2567,33 +3501,43 @@ SELECT
   NULL::numeric AS hours_module2,
   NULL::numeric AS hours_module3,
   NULL::numeric AS hours_module4,
-  NULL::numeric AS streams_count,
-  NULL::numeric AS groups_count,
+  MAX(v.streams_count) AS streams_count,
+  MAX(v.groups_count) AS groups_count,
   NULL::numeric AS aud_lecture_hours,
   NULL::numeric AS aud_seminar_hours,
   NULL::numeric AS aud_nis_ps_sn_hours,
   NULL::numeric AS aud_total_hours,
   NULL::numeric AS students_count,
   NULL::numeric AS current_control_hours,
-  SUM(hours) AS total_hours,
-  STRING_AGG(DISTINCT faculty_name, ', ') AS faculty_names,
-  MIN(academic_year) AS academic_year
-FROM v_workload_by_worktype
+  SUM(v.hours) AS total_hours,
+  STRING_AGG(DISTINCT v.faculty_name, ', ') AS faculty_names,
+  MIN(v.academic_year) AS academic_year,
+  NULL::boolean AS ar_accepted
+FROM v_workload_by_worktype v
 WHERE
-  (@useOpFilter = false OR op_id = ANY(@opIds)) AND
-  (@course IS NULL OR course_no = @course) AND
-  (@y IS NULL OR academic_year = @y) AND
-  (@depNames IS NULL OR array_length(@depNames, 1) IS NULL OR department_name = ANY(@depNames)) AND
-  (@moduleNos IS NULL OR array_length(@moduleNos, 1) IS NULL OR module_number = ANY(@moduleNos))
-GROUP BY op_name, education_level, module_name, discipline_no, discipline_name, department_name, course_no
+  (@useOpFilter = false OR v.op_id = ANY(@opIds)) AND
+  (@course IS NULL OR v.course_no = @course) AND
+  (@y IS NULL OR v.academic_year = @y) AND
+  (@depNames IS NULL OR array_length(@depNames, 1) IS NULL OR v.department_name = ANY(@depNames)) AND
+  (@moduleNos IS NULL OR array_length(@moduleNos, 1) IS NULL OR v.module_number = ANY(@moduleNos))
+GROUP BY v.op_name, v.education_level, v.module_name, v.discipline_no, v.discipline_name, v.department_name, v.course_no
 ORDER BY discipline_name
 LIMIT 500;
 "
         : @"
 SELECT
   pd.plan_discipline_id AS id,
-  ep.name AS ops,
-  ep.education_level,
+  (SELECT STRING_AGG(ep2.name, ', ' ORDER BY ep2.name)
+   FROM plan_discipline_programs pdp2
+   JOIN plan_programs pp2 ON pp2.plan_program_id = pdp2.plan_program_id
+   JOIN educational_programs ep2 ON ep2.op_id = pp2.op_id
+   WHERE pdp2.plan_discipline_id = pd.plan_discipline_id) AS ops,
+  (SELECT ep2.education_level
+   FROM plan_discipline_programs pdp2
+   JOIN plan_programs pp2 ON pp2.plan_program_id = pdp2.plan_program_id
+   JOIN educational_programs ep2 ON ep2.op_id = pp2.op_id
+   WHERE pdp2.plan_discipline_id = pd.plan_discipline_id
+   LIMIT 1) AS education_level,
   sp.direction,
   sp.funding_type,
   pm.module_name,
@@ -2628,17 +3572,24 @@ SELECT
   NULL::numeric AS total_hours,
   NULL::text AS faculty_names,
   sp.academic_year,
-  pd.plan_id
+  pd.plan_id,
+  pd.dept_request_status,
+  pd.dept_message_to_op,
+  pd.smartplan_id,
+  pd.ar_accepted,
+  pd.implementing_department_id
 FROM plan_disciplines pd
-JOIN plan_discipline_programs pdp ON pd.plan_discipline_id = pdp.plan_discipline_id
-JOIN plan_programs pp ON pdp.plan_program_id = pp.plan_program_id
-JOIN educational_programs ep ON pp.op_id = ep.op_id
 JOIN study_plans sp ON pd.plan_id = sp.plan_id
 LEFT JOIN plan_modules pm ON pd.module_id = pm.module_id
 LEFT JOIN departments d ON pd.implementing_department_id = d.department_id
 WHERE
   (
-    (@useOpFilter = false OR ep.op_id = ANY(@opIds))
+    @useOpFilter = false OR EXISTS (
+      SELECT 1 FROM plan_discipline_programs pdp3
+      JOIN plan_programs pp3 ON pp3.plan_program_id = pdp3.plan_program_id
+      WHERE pdp3.plan_discipline_id = pd.plan_discipline_id
+        AND pp3.op_id = ANY(@opIds)
+    )
   ) AND
   (@course IS NULL OR pd.course_no = @course) AND
   (@y IS NULL OR sp.academic_year = @y) AND
@@ -2658,6 +3609,28 @@ LIMIT 500;
     cmd.Parameters.AddWithValue("depNames", NpgsqlDbType.Array | NpgsqlDbType.Text, (object?)departmentNames ?? DBNull.Value);
     cmd.Parameters.AddWithValue("departmentIds", NpgsqlDbType.Array | NpgsqlDbType.Integer, (object?)planDepartmentIdsParam ?? DBNull.Value);
     cmd.Parameters.AddWithValue("moduleNos", NpgsqlDbType.Array | NpgsqlDbType.Integer, (object?)planModuleNosParam ?? DBNull.Value);
+
+    // Считаем дисциплины, требующие внимания АРа (под корректировкой или отклонённые)
+    int needsAttentionCount = 0;
+    if (user.CanEditPlan)
+    {
+        try
+        {
+            await using var attentionCmd = new NpgsqlCommand(@"
+SELECT COUNT(*)
+FROM plan_disciplines pd
+JOIN plan_discipline_programs pdp ON pd.plan_discipline_id = pdp.plan_discipline_id
+JOIN plan_programs pp ON pdp.plan_program_id = pp.plan_program_id
+JOIN educational_programs ep ON pp.op_id = ep.op_id
+WHERE pd.dept_request_status IN ('under_correction', 'rejected')
+  AND (@useOpFilter = false OR ep.op_id = ANY(@opIds));", conn);
+            attentionCmd.Parameters.AddWithValue("useOpFilter", NpgsqlDbType.Boolean, useOpFilter);
+            attentionCmd.Parameters.AddWithValue("opIds", NpgsqlDbType.Array | NpgsqlDbType.Integer, opIdsParam!);
+            var attObj = await attentionCmd.ExecuteScalarAsync();
+            needsAttentionCount = attObj is DBNull or null ? 0 : Convert.ToInt32(attObj);
+        }
+        catch { }
+    }
 
     var sb = new StringBuilder(body.ToString());
     sb.Append("<section class='stats-grid'>")
@@ -2682,6 +3655,13 @@ LIMIT 500;
       .Append("<div class='stat-value'>").Append(pdCount).Append("</div>")
       .Append("</div>")
       .Append("</section>");
+    if (needsAttentionCount > 0)
+        sb.Append("<section class=\"alert-banner alert-banner--warning\">")
+          .Append("<svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z\"/><line x1=\"12\" y1=\"9\" x2=\"12\" y2=\"13\"/><line x1=\"12\" y1=\"17\" x2=\"12.01\" y2=\"17\"/></svg>")
+          .Append("<span><strong>").Append(needsAttentionCount).Append(" ")
+          .Append(needsAttentionCount == 1 ? "дисциплина требует" : needsAttentionCount < 5 ? "дисциплины требуют" : "дисциплин требуют")
+          .Append(" вашего внимания</strong> — возвращены на корректировку или отклонены департаментом. Найдите строки со статусом «На корректировке» или «Отклонено» и внесите исправления.</span>")
+          .Append("</section>");
     sb.Append("<section class=\"card\"><div class=\"meta\">")
       .Append("<div><span class=\"meta__k\">ОП</span><span class=\"meta__v\">").Append(ParseHelpers.H(opLabel)).Append("</span></div>")
       .Append("<div><span class=\"meta__k\">Курс</span><span class=\"meta__v\">").Append(courseNoValue?.ToString() ?? "Все").Append("</span></div>")
@@ -2690,28 +3670,30 @@ LIMIT 500;
 
     // диагностика убрана из интерфейса
 
-    if (opNames.Length > 0)
+    if (useWorkloadFallback)
     {
         if (opIdsParam is not null)
         {
             await using var derivedCmd = new NpgsqlCommand(@"
 SELECT
-  op_name,
-  education_level,
-  module_name,
-  discipline_no,
-  discipline_name,
-  department_name,
-  course_no,
-  SUM(hours) AS total_hours,
-  STRING_AGG(DISTINCT faculty_name, ', ') AS faculty_names
-FROM v_workload_by_worktype
+  v.op_name,
+  v.education_level,
+  v.module_name,
+  v.discipline_no,
+  v.discipline_name,
+  v.department_name,
+  v.course_no,
+  SUM(v.hours) AS total_hours,
+  STRING_AGG(DISTINCT v.faculty_name, ', ') AS faculty_names,
+  MAX(v.streams_count) AS streams_count,
+  MAX(v.groups_count) AS groups_count
+FROM v_workload_by_worktype v
 WHERE
-  op_id = ANY(@opIds) AND
-  (@course IS NULL OR course_no = @course) AND
-  (@y IS NULL OR academic_year = @y)
-GROUP BY op_name, education_level, module_name, discipline_no, discipline_name, department_name, course_no
-ORDER BY discipline_name
+  v.op_id = ANY(@opIds) AND
+  (@course IS NULL OR v.course_no = @course) AND
+  (@y IS NULL OR v.academic_year = @y)
+GROUP BY v.op_name, v.education_level, v.module_name, v.discipline_no, v.discipline_name, v.department_name, v.course_no
+ORDER BY v.discipline_name
 LIMIT 500;
 ", conn);
             derivedCmd.Parameters.AddWithValue("opIds", NpgsqlDbType.Array | NpgsqlDbType.Integer, opIdsParam);
@@ -2749,7 +3731,7 @@ LIMIT 500;
               .Append("<th>В том числе всего в 3 модуле</th>")
               .Append("<th>В том числе всего в 4 модуле</th>")
               .Append("<th>Потоки</th>")
-              .Append("<th>Группы</th>")
+              .Append("<th>Группы учебные</th>")
               .Append("<th>Общая ауд нагрузка по лекциям</th>")
               .Append("<th>Общая ауд нагрузка по семинарам</th>")
               .Append("<th>Общая ауд нагрузка по НИС / ПС / СН</th>")
@@ -2776,6 +3758,8 @@ LIMIT 500;
                     var course = PlanRowReader.SafeReadIntOrStringAsString(d, 6);
                     var totalHours = d.IsDBNull(7) ? "" : d.GetDecimal(7).ToString(CultureInfo.InvariantCulture);
                     var facultyNames = d.IsDBNull(8) ? "" : d.GetString(8);
+                    var streamsDisp = d.IsDBNull(9) ? "" : Convert.ToString(d.GetValue(9), CultureInfo.InvariantCulture) ?? "";
+                    var groupsDisp = d.IsDBNull(10) ? "" : Convert.ToString(d.GetValue(10), CultureInfo.InvariantCulture) ?? "";
 
                     sb.Append("<tr>")
                       .Append("<td>").Append(ParseHelpers.H(op)).Append("</td>")
@@ -2802,8 +3786,8 @@ LIMIT 500;
                       .Append("<td></td>")
                       .Append("<td></td>")
                       .Append("<td></td>")
-                      .Append("<td></td>")
-                      .Append("<td></td>")
+                      .Append("<td>").Append(ParseHelpers.H(streamsDisp)).Append("</td>")
+                      .Append("<td>").Append(ParseHelpers.H(groupsDisp)).Append("</td>")
                       .Append("<td></td>")
                       .Append("<td></td>")
                       .Append("<td></td>")
@@ -2832,6 +3816,7 @@ SELECT
   module_name,
   discipline_no,
   discipline_name,
+  groups_count,
   work_type,
   hours,
   faculty_name
@@ -2859,6 +3844,7 @@ LIMIT 500;
           .Append("<th>Модуль</th>")
           .Append("<th>№ дисциплины</th>")
           .Append("<th>Дисциплина</th>")
+          .Append("<th>Группы учебные</th>")
           .Append("<th>Вид работ</th>")
           .Append("<th>Часы</th>")
           .Append("<th>Преподаватель</th>")
@@ -2874,6 +3860,7 @@ LIMIT 500;
                 var modNoStr = PlanRowReader.SafeReadIntOrStringAsString(wl, 2);
                 var modNo = int.TryParse(modNoStr, out var mn) ? (int?)mn : null;
                 var modName = wl.IsDBNull(3) ? "" : wl.GetString(3);
+                var wlGroups = wl.IsDBNull(6) ? "—" : Convert.ToString(wl.GetValue(6), CultureInfo.InvariantCulture) ?? "—";
                 sb.Append("<tr>")
                   .Append("<td class=\"col-year\">").Append(ParseHelpers.H(wl.IsDBNull(0) ? "" : wl.GetString(0))).Append("</td>")
                   .Append("<td>").Append(ParseHelpers.H(wlOpName)).Append("</td>")
@@ -2881,57 +3868,73 @@ LIMIT 500;
                   .Append("<td>").Append(ParseHelpers.H($"{(modNo is null ? "" : modNo.ToString())} {modName}".Trim())).Append("</td>")
                   .Append("<td>").Append(ParseHelpers.H(wl.IsDBNull(4) ? "" : wl.GetString(4))).Append("</td>")
                   .Append("<td>").Append(ParseHelpers.H(wl.IsDBNull(5) ? "" : wl.GetString(5))).Append("</td>")
-                  .Append("<td>").Append(ParseHelpers.H(wl.IsDBNull(6) ? "" : wl.GetString(6))).Append("</td>")
-                  .Append("<td>").Append(wl.IsDBNull(7) ? "" : wl.GetDecimal(7).ToString(CultureInfo.InvariantCulture)).Append("</td>")
-                  .Append("<td>").Append(ParseHelpers.H(wl.IsDBNull(8) ? "" : wl.GetString(8))).Append("</td>")
+                  .Append("<td>").Append(ParseHelpers.H(wlGroups)).Append("</td>")
+                  .Append("<td>").Append(ParseHelpers.H(wl.IsDBNull(7) ? "" : wl.GetString(7))).Append("</td>")
+                  .Append("<td>").Append(wl.IsDBNull(8) ? "" : wl.GetDecimal(8).ToString(CultureInfo.InvariantCulture)).Append("</td>")
+                  .Append("<td>").Append(ParseHelpers.H(wl.IsDBNull(9) ? "" : wl.GetString(9))).Append("</td>")
                   .Append("</tr>");
             }
         }
         if (!wlHasRows)
         {
-            sb.Append("<tr><td colspan=\"9\">Нет данных по выбранной ОП</td></tr>");
+            sb.Append("<tr><td colspan=\"10\">Нет данных по выбранной ОП</td></tr>");
         }
 
         sb.Append("</tbody></table></div></div></section>");
     }
 
-    sb.Append("<section class=\"card card--flush\"><div class=\"table-scroll-top\"><div class=\"table-scroll-bar\" role=\"scrollbar\" aria-orientation=\"horizontal\"><div class=\"table-scroll-bar__inner\"></div></div><div class=\"table-wrap\"><table class=\"table\"><thead><tr>")
-      .Append("<th>ОП</th>")
-      .Append("<th>Уровень</th>")
-      .Append("<th>Направление</th>")
-      .Append("<th>Бюджетная / коммерческая</th>")
-      .Append("<th>Модуль учебного плана</th>")
-      .Append("<th>Подтип модуля</th>")
-      .Append("<th>№ дисц.</th>")
-      .Append("<th>Наименование дисциплины</th>")
-      .Append("<th>Реализующее подразделение</th>")
-      .Append("<th>Принадлежность реализующего департамента</th>")
-      .Append("<th>Вид дисциплины (обязательная, по выбору, факультатив)</th>")
-      .Append("<th>Является ключевым семинаром (НИС, ПС, СНаставника)</th>")
-      .Append("<th>Наличие онлайн-курса</th>")
-      .Append("<th>Курс</th>")
-      .Append("<th>Наличие заявки на МУ от АР</th>")
-      .Append("<th>Язык</th>")
-      .Append("<th>МКД</th>")
-      .Append("<th>Зач.ед.</th>")
-      .Append("<th>Лекции по РУП</th>")
-      .Append("<th>Семинары по РУП</th>")
-      .Append("<th>Всего часов по РУП</th>")
-      .Append("<th>В том числе всего в 1 модуле</th>")
-      .Append("<th>В том числе всего в 2 модуле</th>")
-      .Append("<th>В том числе всего в 3 модуле</th>")
-      .Append("<th>В том числе всего в 4 модуле</th>")
-      .Append("<th>Потоки</th>")
-      .Append("<th>Группы</th>")
-      .Append("<th>Общая ауд нагрузка по лекциям</th>")
-      .Append("<th>Общая ауд нагрузка по семинарам</th>")
-      .Append("<th>Общая ауд нагрузка по НИС / ПС / СН</th>")
-      .Append("<th>Всего ауд нагрузка</th>")
-      .Append("<th>Всего ауд нагрузка (с удовением)</th>")
-      .Append("<th>Число студентов</th>")
-      .Append("<th>Нагрузка на текущий контроль</th>")
-      .Append("<th>Всего часов нагрузки</th>")
-      .Append("<th>ФИО ППС</th>")
+    var planAllOps = new List<string>();
+    try
+    {
+        await using var planOpsCmd = new NpgsqlCommand("SELECT DISTINCT name FROM educational_programs WHERE is_active = true ORDER BY name", conn);
+        await using var planOpsR = await planOpsCmd.ExecuteReaderAsync();
+        while (await planOpsR.ReadAsync()) planAllOps.Add(planOpsR.GetString(0));
+    }
+    catch { }
+    if (planAllOps.Count == 0) planAllOps.AddRange(OpMagistracy.Concat(OpBachelor).Distinct().OrderBy(x => x));
+
+    var planModules = await LoadModules(ds);
+    var planDeptList = departments;
+
+    sb.Append("<section class=\"card card--flush\"><div class=\"table-scroll-top\"><div class=\"table-scroll-bar\" role=\"scrollbar\" aria-orientation=\"horizontal\"><div class=\"table-scroll-bar__inner\"></div></div><div class=\"table-wrap\"><table class=\"table\" id=\"plan-table\"><thead><tr>")
+      .Append("<th><input type='checkbox' data-select-all='plan' aria-label='Выбрать все'").Append(user.CanEditPlan ? ">" : " disabled>").Append("</th>")
+      .Append("<th>Статус согласования</th><th>Комментарий департамента</th><th>ID Смартплан</th><th></th>")
+      .Append("<th>ОП <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Уровень <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Направление <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Бюджет / Коммерческая <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Модуль учебного плана <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Подтип модуля <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>№ дисц. <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Наименование дисциплины <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Реализующее подразделение <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Принадлежность реализующего департамента <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Вид дисциплины (обязательная, по выбору, факультатив) <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Является ключевым семинаром (НИС, ПС, СНаставника) <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Наличие онлайн-курса <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Курс <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Наличие заявки на МУ от АР <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Язык <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>МКД <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Зач.ед. <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Лекции по РУП <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Семинары по РУП <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Всего часов по РУП <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>В том числе всего в 1 модуле <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>В том числе всего в 2 модуле <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>В том числе всего в 3 модуле <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>В том числе всего в 4 модуле <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Потоки <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Группы учебные <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Общая ауд нагрузка по лекциям <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Общая ауд нагрузка по семинарам <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Общая ауд нагрузка по НИС / ПС / СН <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Всего ауд нагрузка <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Всего ауд нагрузка (с удовением) <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Число студентов <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Нагрузка на текущий контроль <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Всего часов нагрузки <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>ФИО ППС <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
       .Append("</tr></thead><tbody>");
 
     var hasRows = false;
@@ -2979,23 +3982,76 @@ LIMIT 500;
             var currentControl = r.IsDBNull(33) ? "" : PlanRowReader.SafeReadDecimal(r, 33).ToString(CultureInfo.InvariantCulture);
             var totalHours = r.IsDBNull(34) ? "" : PlanRowReader.SafeReadDecimal(r, 34).ToString(CultureInfo.InvariantCulture);
             var facultyNames = r.IsDBNull(35) ? "" : r.GetString(35);
+            var reqStatus = r.FieldCount > 38 && !r.IsDBNull(38) ? r.GetString(38) : DisciplineWorkflow.Draft;
+            var deptMsg = r.FieldCount > 39 && !r.IsDBNull(39) ? r.GetString(39) : "";
+            var smartplanDisp = r.FieldCount > 40 && !r.IsDBNull(40) ? r.GetString(40) : "";
+            var arAccepted = r.FieldCount > 41 && !r.IsDBNull(41) && r.GetBoolean(41);
+            // Читаем ID департамента напрямую из запроса (индекс 42) вместо поиска по имени
+            var implDeptIdForFlow = r.FieldCount > 42 && !r.IsDBNull(42)
+                ? PlanRowReader.SafeReadInt32(r, 42)
+                : planDeptList.FirstOrDefault(d => d.name == implementingDepartment).id;
+            var canSendToDept = user.CanEditPlan && DisciplineWorkflow.OpMayEditRow(reqStatus) && implDeptIdForFlow != 0;
             var formId = $"plan-{planDisciplineIdDb?.ToString() ?? "new"}";
 
-            sb.Append("<tr>")
-              .Append("<td>").Append(ParseHelpers.H(opsName)).Append("</td>")
-              .Append("<td>").Append(ParseHelpers.H(level)).Append("</td>")
-              .Append("<td>").Append(ParseHelpers.H(direction)).Append("</td>")
-              .Append("<td>").Append(ParseHelpers.H(OpBudgetHelper.OpBudgetCommercial(opsName))).Append("</td>")
-              .Append("<td>").Append(ParseHelpers.H(moduleName)).Append("</td>")
-              .Append("<td>").Append(ParseHelpers.H(moduleSubtype)).Append("</td>")
+            var statusBadge = reqStatus?.Trim().ToLowerInvariant() switch {
+                DisciplineWorkflow.Draft         => "<span class='badge badge--status badge--draft'>Черновик</span>",
+                DisciplineWorkflow.Sent          => "<span class='badge badge--status badge--sent'>На согласовании</span>",
+                DisciplineWorkflow.UnderReview   => "<span class='badge badge--status badge--review'>На рассмотрении</span>",
+                DisciplineWorkflow.UnderCorrection => "<span class='badge badge--status badge--correction'>⚠ На корректировке</span>",
+                DisciplineWorkflow.Rejected      => "<span class='badge badge--status badge--rejected'>✕ Отклонено</span>",
+                DisciplineWorkflow.Approved      => "<span class='badge badge--status badge--approved'>✓ Согласовано</span>",
+                _ => "<span class='badge badge--status badge--draft'>" + ParseHelpers.H(DisciplineWorkflow.StatusLabelRu(reqStatus)) + "</span>"
+            };
+            var deptMsgHtml = string.IsNullOrWhiteSpace(deptMsg) ? "" :
+                (reqStatus == DisciplineWorkflow.UnderCorrection || reqStatus == DisciplineWorkflow.Rejected)
+                    ? "<div class='dept-msg dept-msg--alert'><svg width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='10'/><line x1='12' y1='8' x2='12' y2='12'/><line x1='12' y1='16' x2='12.01' y2='16'/></svg> " + ParseHelpers.H(deptMsg) + "</div>"
+                    : "<div class='hint'>" + ParseHelpers.H(deptMsg) + "</div>";
+            sb.Append("<tr").Append(reqStatus == DisciplineWorkflow.UnderCorrection || reqStatus == DisciplineWorkflow.Rejected ? " class='row--needs-attention'" : "").Append(">")
+              .Append("<td><input type='checkbox' class='row-select row-select-plan' name='selectPlanDisciplineId' value='").Append(planDisciplineIdDb?.ToString() ?? "0").Append("'></td>")
+              .Append("<td class=\"cell-nowrap\">")
+              .Append(statusBadge)
+              .Append(arAccepted ? "<br><span class='badge badge--ar-accepted'>✓ Принято АРом</span>" : "")
+              .Append("</td>")
+              .Append("<td>").Append(deptMsgHtml).Append("</td>")
+              .Append("<td>").Append(ParseHelpers.H(string.IsNullOrWhiteSpace(smartplanDisp) ? "—" : smartplanDisp)).Append("</td>")
+              .Append("<td class=\"cell-action\">");
+            if (canSendToDept && planDisciplineIdDb is int sendPid)
+            {
+                var btnLabel = reqStatus == DisciplineWorkflow.UnderCorrection
+                    ? "Повторно отправить"
+                    : reqStatus == DisciplineWorkflow.Rejected
+                        ? "Отправить повторно"
+                        : "Отправить в департамент";
+                sb.Append("<form method=\"post\" action=\"/uiplan/send-for-approval\" style=\"display:inline\">")
+                  .Append("<input type=\"hidden\" name=\"planDisciplineId\" value=\"").Append(sendPid).Append("\" />")
+                  .Append("<button type=\"submit\" class=\"btn btn--sm").Append(reqStatus == DisciplineWorkflow.UnderCorrection ? " btn--warning" : "").Append("\">").Append(ParseHelpers.H(btnLabel)).Append("</button></form>");
+            }
+            else if (user.CanEditPlan && DisciplineWorkflow.OpMayEditRow(reqStatus) && implDeptIdForFlow == 0)
+                sb.Append("<span class=\"hint\">Укажите департамент</span>");
+            sb.Append("</td>")
               .Append("<td>")
               .Append("<form id=\"").Append(formId).Append("\" method=\"post\" action=\"/uiplan/update\"></form>")
               .Append("<input type=\"hidden\" name=\"planId\" value=\"").Append(planIdDb).Append("\" form=\"").Append(formId).Append("\">")
               .Append("<input type=\"hidden\" name=\"planDisciplineId\" value=\"").Append(planDisciplineIdDb?.ToString() ?? "").Append("\" form=\"").Append(formId).Append("\">")
+              .Append("<select class=\"input\" name=\"opName\" form=\"").Append(formId).Append("\">")
+              .Append(OptionsListStrings(planAllOps.ToArray(), opsName, "ОП"))
+              .Append("</select></td>")
+              .Append("<td><select class=\"input\" name=\"educationLevel\" form=\"").Append(formId).Append("\">")
+              .Append(OptionsListStrings(SelectOptions.EducationLevels, level, "Уровень"))
+              .Append("</select></td>")
+              .Append("<td><input class=\"input\" name=\"direction\" value=\"").Append(ParseHelpers.H(direction)).Append("\" form=\"").Append(formId).Append("\" placeholder=\"Направление\"></td>")
+              .Append("<td class=\"cell-budget\">").Append(ParseHelpers.H(OpBudgetHelper.OpBudgetCommercial(opsName))).Append("</td>")
+              .Append("<td><select class=\"input\" name=\"moduleId\" form=\"").Append(formId).Append("\">")
+              .Append(OptionsList(planModules, planModules.FirstOrDefault(m => m.name == moduleName).id == 0 ? (int?)null : planModules.FirstOrDefault(m => m.name == moduleName).id, "Модуль"))
+              .Append("</select></td>")
+              .Append("<td><input class=\"input\" name=\"moduleSubtype\" value=\"").Append(ParseHelpers.H(moduleSubtype)).Append("\" form=\"").Append(formId).Append("\" placeholder=\"Подтип\"></td>")
+              .Append("<td>")
               .Append("<input class=\"input\" name=\"disciplineNo\" value=\"").Append(ParseHelpers.H(disciplineNo)).Append("\" form=\"").Append(formId).Append("\" placeholder=\"№\" pattern=\"[0-9]*\" title=\"Только цифры\">")
               .Append("</td>")
               .Append("<td><input class=\"input\" name=\"disciplineName\" value=\"").Append(ParseHelpers.H(disciplineName)).Append("\" form=\"").Append(formId).Append("\"></td>")
-              .Append("<td>").Append(ParseHelpers.H(implementingDepartment)).Append("</td>")
+              .Append("<td><select class=\"input\" name=\"implementingDepartmentId\" form=\"").Append(formId).Append("\">")
+              .Append(OptionsList(planDeptList, planDeptList.FirstOrDefault(d => d.name == implementingDepartment).id == 0 ? (int?)null : planDeptList.FirstOrDefault(d => d.name == implementingDepartment).id, "Департамент"))
+              .Append("</select></td>")
               .Append("<td><input class=\"input\" name=\"implementingDepParent\" value=\"").Append(ParseHelpers.H(implementingParent)).Append("\" form=\"").Append(formId).Append("\"></td>")
               .Append("<td><select class=\"input\" name=\"disciplineKind\" form=\"").Append(formId).Append("\">").Append(OptionsListStrings(SelectOptions.DisciplineKinds, disciplineKind, "Вид")).Append("</select></td>")
               .Append("<td><label class=\"check\"><input type=\"checkbox\" name=\"isKeySeminar\" ").Append(isKeySeminar is not null && isKeySeminar.Value ? "checked" : "").Append(" form=\"").Append(formId).Append("\">Да</label></td>")
@@ -3066,13 +4122,21 @@ ORDER BY ep.name", conn))
         foreach (var (pid, label) in planOptions)
             planSelectOptions.Append("<option value=\"").Append(pid).Append("\"").Append(pid == defaultPlanId ? " selected" : "").Append(">").Append(ParseHelpers.H(label)).Append("</option>");
         sb.Append("<tr class=\"plan-new-template\" style=\"display:none\" data-plan-id=\"0\">")
+          .Append("<td><input type='checkbox' class='row-select row-select-plan' name='selectPlanDisciplineId' value='0'></td>")
+          .Append("<td class=\"hint\">—</td><td class=\"hint\">—</td><td class=\"hint\">—</td><td class=\"hint\">—</td>")
           .Append("<td><select class=\"input\" name=\"planId\" form=\"").Append(newFormId).Append("\" required>").Append(planSelectOptions).Append("</select></td>")
-          .Append("<td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>")
+          .Append("<td><select class=\"input\" name=\"educationLevel\" form=\"").Append(newFormId).Append("\">").Append(OptionsListStrings(SelectOptions.EducationLevels, "", "Уровень")).Append("</select></td>")
+          .Append("<td><input class=\"input\" name=\"direction\" value=\"\" form=\"").Append(newFormId).Append("\" placeholder=\"Направление\"></td>")
+          .Append("<td class=\"cell-budget\">—</td>")
+          .Append("<td><select class=\"input\" name=\"moduleId\" form=\"").Append(newFormId).Append("\">").Append(OptionsList(planModules, null, "Модуль")).Append("</select></td>")
+          .Append("<td><input class=\"input\" name=\"moduleSubtype\" value=\"\" form=\"").Append(newFormId).Append("\" placeholder=\"Подтип\"></td>")
+          .Append("<td>")
           .Append("<form id=\"").Append(newFormId).Append("\" method=\"post\" action=\"/uiplan/update\"></form>")
           .Append("<input type=\"hidden\" name=\"planDisciplineId\" value=\"\" form=\"").Append(newFormId).Append("\">")
           .Append("<input class=\"input\" name=\"disciplineNo\" value=\"\" form=\"").Append(newFormId).Append("\" placeholder=\"№\" pattern=\"[0-9]*\" title=\"Только цифры\"></td>")
           .Append("<td><input class=\"input\" name=\"disciplineName\" value=\"\" form=\"").Append(newFormId).Append("\" placeholder=\"Название\"></td>")
-          .Append("<td>—</td><td><input class=\"input\" name=\"implementingDepParent\" value=\"\" form=\"").Append(newFormId).Append("\"></td>")
+          .Append("<td><select class=\"input\" name=\"implementingDepartmentId\" form=\"").Append(newFormId).Append("\">").Append(OptionsList(departments, null, "Департамент")).Append("</select></td>")
+          .Append("<td><input class=\"input\" name=\"implementingDepParent\" value=\"\" form=\"").Append(newFormId).Append("\"></td>")
           .Append("<td><select class=\"input\" name=\"disciplineKind\" form=\"").Append(newFormId).Append("\">").Append(OptionsListStrings(SelectOptions.DisciplineKinds, "", "Вид")).Append("</select></td>")
           .Append("<td><label class=\"check\"><input type=\"checkbox\" name=\"isKeySeminar\" form=\"").Append(newFormId).Append("\">Да</label></td>")
           .Append("<td><label class=\"check\"><input type=\"checkbox\" name=\"hasOnlineCourse\" form=\"").Append(newFormId).Append("\">Да</label></td>")
@@ -3103,12 +4167,12 @@ ORDER BY ep.name", conn))
     }
 
     sb.Append("</tbody></table></div></div></section>");
-    return Results.Content(Layout("Учебный план", "plan", sb.ToString(), user.Login, user.IsAdmin), "text/html; charset=utf-8");
+    return Results.Content(Layout("Учебный план", "plan", sb.ToString(), user.Login, user.IsAdmin, user.CanReviewDisciplineRequests, GetCsrfToken(ctx)), "text/html; charset=utf-8");
     }
     catch (PostgresException ex) when (ex.SqlState == "42703")
     {
         var msg = $"Ошибка БД: {ex.Message}. Возможно, не выполнена миграция (add_aud_total_columns.sql) или нужно пересобрать проект (dotnet build) и перезапустить.";
-        return Results.Content(Layout("Учебный план — ошибка", "plan", $"<section class='card'><p class='error'>{ParseHelpers.H(msg)}</p></section>", user.Login, user.IsAdmin), "text/html; charset=utf-8");
+        return Results.Content(Layout("Учебный план — ошибка", "plan", $"<section class='card'><p class='error'>{ParseHelpers.H(msg)}</p></section>", user.Login, user.IsAdmin, user.CanReviewDisciplineRequests, GetCsrfToken(ctx)), "text/html; charset=utf-8");
     }
 });
 
@@ -3131,7 +4195,8 @@ app.MapGet("/uiplan/export", async (
         opNames = opNames.Length == 0 ? user.AllowedOpNames : opNames.Where(o => allowedSet.Contains(o)).ToArray();
     }
     string[]? opNamesLike;
-    if (!user.IsAdmin && user.AllowedOpNames.Length == 0)
+    // АР (CanEditPlan=true) с пустым AllowedOpNames видит всё — как на странице
+    if (!user.IsAdmin && user.AllowedOpNames.Length == 0 && !user.CanEditPlan)
         opNamesLike = new[] { "%\u0000%" };
     else
         opNamesLike = opNames.Length == 0 ? null : opNames.Select(n => $"%{n}%").ToArray();
@@ -3143,8 +4208,6 @@ app.MapGet("/uiplan/export", async (
         var allowedDept = new HashSet<int>(user.AllowedDepartmentIds);
         departmentIds = departmentIds.Length == 0 ? user.AllowedDepartmentIds : departmentIds.Where(d => allowedDept.Contains(d)).ToArray();
     }
-    if (!user.IsAdmin && user.AllowedDepartmentIds.Length == 0)
-        departmentIds = new[] { -1 };
     var yearValue = string.IsNullOrWhiteSpace(year) ? null : year.Trim();
 
     await using var conn = await ds.OpenConnectionAsync();
@@ -3238,7 +4301,7 @@ ORDER BY pd.discipline_name;
         "Лекции по РУП", "Семинары по РУП", "Всего часов по РУП",
         "В том числе всего в 1 модуле", "В том числе всего в 2 модуле",
         "В том числе всего в 3 модуле", "В том числе всего в 4 модуле",
-        "Потоки", "Группы", "Общая ауд нагрузка по лекциям",
+        "Потоки", "Группы учебные", "Общая ауд нагрузка по лекциям",
         "Общая ауд нагрузка по семинарам", "Общая ауд нагрузка по НИС / ПС / СН",
         "Всего ауд нагрузка", "Число студентов", "Нагрузка на текущий контроль", "Всего часов нагрузки",
         "ФИО ППС", "Год"
@@ -3424,6 +4487,10 @@ app.MapPost("/uiplan/update", async (
     NpgsqlDataSource ds,
     string? planId,
     string? planDisciplineId,
+    string? opName,
+    string? educationLevel,
+    string? direction,
+    string? moduleSubtype,
     string? disciplineNo,
     string? disciplineName,
     string? moduleId,
@@ -3478,6 +4545,14 @@ app.MapPost("/uiplan/update", async (
         return Results.BadRequest(string.Join("\n", errors));
 
     await using var conn = await ds.OpenConnectionAsync();
+    if (planDisciplineIdValue is int existingRowId)
+    {
+        await using var st = new NpgsqlCommand("SELECT dept_request_status FROM plan_disciplines WHERE plan_discipline_id = @id", conn);
+        st.Parameters.AddWithValue("id", NpgsqlDbType.Integer, existingRowId);
+        var stObj = await st.ExecuteScalarAsync();
+        if (!DisciplineWorkflow.OpMayEditRow(stObj?.ToString()))
+            return Results.BadRequest("Редактирование недоступно: дисциплина на согласовании, уже согласована или в каталоге. Изменения — только через возврат на доработку со стороны департамента.");
+    }
     if (planDisciplineIdValue is null)
     {
         if (planIdValue is null)
@@ -3607,11 +4682,421 @@ WHERE plan_discipline_id = @planDisciplineId;
         await cmd.ExecuteNonQueryAsync();
     }
 
-    return Results.Redirect("/uiplan");
+    var effectivePdId = planDisciplineIdValue ?? 0;
+
+    if (!string.IsNullOrWhiteSpace(opName) && effectivePdId > 0)
+    {
+        await using var opLinkCmd = new NpgsqlCommand(@"
+SELECT pp.plan_program_id FROM plan_programs pp
+JOIN educational_programs ep ON ep.op_id = pp.op_id
+WHERE pp.plan_id = (SELECT plan_id FROM plan_disciplines WHERE plan_discipline_id = @pdId)
+  AND ep.name = @opName LIMIT 1", conn);
+        opLinkCmd.Parameters.AddWithValue("pdId", NpgsqlDbType.Integer, effectivePdId);
+        opLinkCmd.Parameters.AddWithValue("opName", NpgsqlDbType.Text, opName);
+        var ppObj = await opLinkCmd.ExecuteScalarAsync();
+        if (ppObj is int ppId)
+        {
+            await using var checkLink = new NpgsqlCommand(
+                "SELECT 1 FROM plan_discipline_programs WHERE plan_discipline_id = @pdId AND plan_program_id = @ppId", conn);
+            checkLink.Parameters.AddWithValue("pdId", NpgsqlDbType.Integer, effectivePdId);
+            checkLink.Parameters.AddWithValue("ppId", NpgsqlDbType.Integer, ppId);
+            if (await checkLink.ExecuteScalarAsync() is null)
+            {
+                await using var delLink = new NpgsqlCommand("DELETE FROM plan_discipline_programs WHERE plan_discipline_id = @pdId", conn);
+                delLink.Parameters.AddWithValue("pdId", NpgsqlDbType.Integer, effectivePdId);
+                await delLink.ExecuteNonQueryAsync();
+                await using var insLink = new NpgsqlCommand("INSERT INTO plan_discipline_programs (plan_discipline_id, plan_program_id) VALUES (@pdId, @ppId) ON CONFLICT DO NOTHING", conn);
+                insLink.Parameters.AddWithValue("pdId", NpgsqlDbType.Integer, effectivePdId);
+                insLink.Parameters.AddWithValue("ppId", NpgsqlDbType.Integer, ppId);
+                await insLink.ExecuteNonQueryAsync();
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(educationLevel))
+        {
+            await using var updLvl = new NpgsqlCommand(@"
+UPDATE educational_programs SET education_level = @lvl
+WHERE name = @opName AND (education_level IS NULL OR education_level <> @lvl)", conn);
+            updLvl.Parameters.AddWithValue("lvl", NpgsqlDbType.Text, educationLevel);
+            updLvl.Parameters.AddWithValue("opName", NpgsqlDbType.Text, opName);
+            await updLvl.ExecuteNonQueryAsync();
+        }
+    }
+
+    if (!string.IsNullOrWhiteSpace(direction) && effectivePdId > 0)
+    {
+        await using var updDir = new NpgsqlCommand(@"
+UPDATE study_plans SET direction = @dir
+WHERE plan_id = (SELECT plan_id FROM plan_disciplines WHERE plan_discipline_id = @pdId)
+  AND (direction IS NULL OR direction <> @dir)", conn);
+        updDir.Parameters.AddWithValue("dir", NpgsqlDbType.Text, direction);
+        updDir.Parameters.AddWithValue("pdId", NpgsqlDbType.Integer, effectivePdId);
+        await updDir.ExecuteNonQueryAsync();
+    }
+
+    return Results.Redirect("/uiplan?saved=1");
+}).DisableAntiforgery();
+
+app.MapPost("/uiplan/send-for-approval", async (HttpContext ctx, NpgsqlDataSource ds) =>
+{
+    var user = await GetCurrentUser(ds, ctx.User);
+    if (user is null) return Results.Redirect("/login");
+    if (!user.CanEditPlan) return Results.Forbid();
+    var form = await ctx.Request.ReadFormAsync();
+    if (!int.TryParse(form["planDisciplineId"].FirstOrDefault()?.Trim(), out var planDisciplineId) || planDisciplineId == 0)
+        return Results.Redirect("/uiplan");
+    await using var conn = await ds.OpenConnectionAsync();
+    await using var cmd = new NpgsqlCommand(@"
+UPDATE plan_disciplines
+SET dept_request_status = 'sent',
+    dept_message_to_op = NULL
+WHERE plan_discipline_id = @id
+  AND implementing_department_id IS NOT NULL
+  AND dept_request_status IN ('draft', 'rejected', 'under_correction');
+", conn);
+    cmd.Parameters.AddWithValue("id", NpgsqlDbType.Integer, planDisciplineId);
+    await cmd.ExecuteNonQueryAsync();
+    return Results.Redirect("/uiplan?sent=1");
+}).DisableAntiforgery();
+
+app.MapPost("/uiplan/accept-all", async (HttpContext ctx, NpgsqlDataSource ds) =>
+{
+    var user = await GetCurrentUser(ds, ctx.User);
+    if (user is null) return Results.Redirect("/login");
+    if (!user.CanEditPlan) return Results.Forbid();
+
+    var form = await ctx.Request.ReadFormAsync();
+    var redirectQuery = form["redirectQuery"].ToString() ?? "";
+
+    // Разбираем фильтры из redirectQuery (те же параметры что в GET /uiplan)
+    var qp = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(redirectQuery);
+    var yearVal = qp.TryGetValue("year", out var yv) ? yv.ToString() : null;
+    var opNamesArr = qp.TryGetValue("opName", out var onv) ? onv.ToArray() : Array.Empty<string>();
+    var courseVal = ParseHelpers.IntOrNull(qp.TryGetValue("courseNo", out var cnv) ? cnv.ToString() : null);
+    var deptIdsArr = (qp.TryGetValue("departmentId", out var dv) ? dv.ToArray() : Array.Empty<string>())
+        .Select(s => ParseHelpers.IntOrNull(s)).Where(x => x.HasValue).Select(x => x!.Value).ToArray();
+
+    await using var conn = await ds.OpenConnectionAsync();
+
+    // Получаем op_id для фильтра по ОП
+    int[]? opIdsParam = null;
+    if (opNamesArr.Length > 0)
+    {
+        var opList = new List<int>();
+        var opNamesLike = opNamesArr.Select(n => $"%{n}%").ToArray();
+        await using var opCmd = new NpgsqlCommand("SELECT op_id FROM educational_programs WHERE name ILIKE ANY(@names)", conn);
+        opCmd.Parameters.AddWithValue("names", NpgsqlDbType.Array | NpgsqlDbType.Text, opNamesLike);
+        await using var opR = await opCmd.ExecuteReaderAsync();
+        while (await opR.ReadAsync()) opList.Add(PlanRowReader.SafeReadInt32(opR, 0));
+        opIdsParam = opList.Count > 0 ? opList.ToArray() : new[] { -1 };
+    }
+
+    var useOpFilter = opIdsParam != null && opIdsParam.Length > 0;
+
+    await using var updCmd = new NpgsqlCommand(@"
+UPDATE plan_disciplines pd
+SET ar_accepted = true
+FROM plan_discipline_programs pdp
+JOIN plan_programs pp ON pdp.plan_program_id = pp.plan_program_id
+JOIN educational_programs ep ON pp.op_id = ep.op_id
+JOIN study_plans sp ON pd.plan_id = sp.plan_id
+WHERE pd.plan_discipline_id = pdp.plan_discipline_id
+  AND (@useOpFilter = false OR ep.op_id = ANY(@opIds))
+  AND (@y IS NULL OR sp.academic_year = @y)
+  AND (@course IS NULL OR pd.course_no = @course)
+  AND (@deptIds IS NULL OR array_length(@deptIds, 1) IS NULL OR pd.implementing_department_id = ANY(@deptIds));
+", conn);
+    updCmd.Parameters.AddWithValue("useOpFilter", NpgsqlDbType.Boolean, useOpFilter);
+    updCmd.Parameters.AddWithValue("opIds", NpgsqlDbType.Array | NpgsqlDbType.Integer,
+        (object?)(opIdsParam ?? new[] { -1 }) );
+    updCmd.Parameters.AddWithValue("y", NpgsqlDbType.Text, (object?)(string.IsNullOrWhiteSpace(yearVal) ? null : yearVal) ?? DBNull.Value);
+    updCmd.Parameters.AddWithValue("course", NpgsqlDbType.Integer, (object?)courseVal ?? DBNull.Value);
+    updCmd.Parameters.AddWithValue("deptIds", NpgsqlDbType.Array | NpgsqlDbType.Integer,
+        deptIdsArr.Length > 0 ? (object)deptIdsArr : DBNull.Value);
+    await updCmd.ExecuteNonQueryAsync();
+
+    var back = string.IsNullOrEmpty(redirectQuery) ? "/uiplan" : "/uiplan?" + redirectQuery;
+    return Results.Redirect(back);
+}).DisableAntiforgery();
+
+app.MapGet("/uidept-discipline-requests", async (HttpContext ctx, NpgsqlDataSource ds) =>
+{
+    var user = await GetCurrentUser(ds, ctx.User);
+    if (user is null) return Results.Redirect("/login");
+    if (!user.CanReviewDisciplineRequests) return Results.Forbid();
+    var reworkOk   = string.Equals(ctx.Request.Query["rework"].ToString(), "1", StringComparison.Ordinal);
+    var savedOk    = string.Equals(ctx.Request.Query["saved"].ToString(),  "1", StringComparison.Ordinal);
+    var errCode    = ctx.Request.Query["err"].ToString();
+    var errSpLock  = string.Equals(errCode, "smartplan_locked", StringComparison.OrdinalIgnoreCase);
+    var errForbid  = string.Equals(errCode, "forbid",           StringComparison.OrdinalIgnoreCase);
+    var errMsg     = string.Equals(errCode, "msg",              StringComparison.OrdinalIgnoreCase);
+    var errSp      = string.Equals(errCode, "smartplan",        StringComparison.OrdinalIgnoreCase);
+    await using var conn = await ds.OpenConnectionAsync();
+    var deptIdsParam = user.IsAdmin
+        ? (object?)null
+        : (user.AllowedDepartmentIds.Length == 0 ? new[] { -1 } : user.AllowedDepartmentIds);
+    await using var cmd = new NpgsqlCommand(@"
+SELECT
+  pd.plan_discipline_id,
+  pd.discipline_no,
+  pd.discipline_name,
+  COALESCE(string_agg(ep.name, ', '), '') AS op_names,
+  d.name AS dept_name,
+  pd.dept_request_status,
+  pd.dept_message_to_op,
+  pd.smartplan_id,
+  sp.academic_year,
+  pd.implementing_department_id
+FROM plan_disciplines pd
+JOIN study_plans sp ON sp.plan_id = pd.plan_id
+LEFT JOIN departments d ON d.department_id = pd.implementing_department_id
+LEFT JOIN plan_discipline_programs pdp ON pdp.plan_discipline_id = pd.plan_discipline_id
+LEFT JOIN plan_programs pp ON pp.plan_program_id = pdp.plan_program_id
+LEFT JOIN educational_programs ep ON ep.op_id = pp.op_id
+WHERE pd.implementing_department_id IS NOT NULL
+  AND (
+    pd.dept_request_status IN ('sent', 'under_review', 'rejected')
+    OR pd.dept_request_status = 'approved'
+  )
+  AND (@deptIds IS NULL OR array_length(@deptIds, 1) IS NULL OR pd.implementing_department_id = ANY(@deptIds))
+GROUP BY pd.plan_discipline_id, pd.discipline_no, pd.discipline_name, d.name,
+  pd.dept_request_status, pd.dept_message_to_op, pd.smartplan_id, sp.academic_year, pd.implementing_department_id
+ORDER BY pd.plan_discipline_id DESC
+LIMIT 500;
+", conn);
+    cmd.Parameters.AddWithValue("deptIds", NpgsqlDbType.Array | NpgsqlDbType.Integer, deptIdsParam ?? DBNull.Value);
+
+    var sb = new StringBuilder();
+    sb.Append("<section class='page-header'><div><h1 class='page-title'>Согласование дисциплин</h1>")
+      .Append("<div class='page-subtitle'>Заявки от академических руководителей по вашим департаментам. Согласуйте, отклоните, укажите «на рассмотрении», «на корректировке» с текстом для АР или внесите ID из Смартплана после согласования. Уже <strong>согласованную</strong> дисциплину (в т.ч. в каталоге) на доработку может вернуть только менеджер реализующего департамента — с повторным согласованием; администратор видит очередь по всем департаментам.</div></div></section>");
+    if (!user.IsAdmin && user.AllowedDepartmentIds.Length == 0)
+        sb.Append("<section class='card'><p class='hint'>У вас не назначены департаменты в профиле пользователя.</p></section>");
+    if (reworkOk)
+        sb.Append("<section class='alert-banner alert-banner--success'><svg width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M22 11.08V12a10 10 0 1 1-5.93-9.14'/><polyline points='22 4 12 14.01 9 11.01'/></svg><span><strong>Дисциплина возвращена на доработку.</strong> Академический руководитель получит статус «На корректировке» с вашим комментарием и сможет исправить и повторно отправить.</span></section>");
+    if (savedOk)
+        sb.Append("<section class='alert-banner alert-banner--success'><svg width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M22 11.08V12a10 10 0 1 1-5.93-9.14'/><polyline points='22 4 12 14.01 9 11.01'/></svg><span><strong>Сохранено!</strong></span></section>");
+    if (errSpLock)
+        sb.Append("<section class='alert-banner alert-banner--error'><svg width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='10'/><line x1='12' y1='8' x2='12' y2='12'/><line x1='12' y1='16' x2='12.01' y2='16'/></svg><span><strong>Ошибка:</strong> ID Смартплана уже зафиксирован. Чтобы изменить дисциплину, используйте «Вернуть на доработку».</span></section>");
+    if (errForbid)
+        sb.Append("<section class='alert-banner alert-banner--error'><svg width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='10'/><line x1='12' y1='8' x2='12' y2='12'/><line x1='12' y1='16' x2='12.01' y2='16'/></svg><span><strong>Ошибка доступа:</strong> у вас нет прав для этого действия. Убедитесь, что вы — менеджер реализующего департамента.</span></section>");
+    if (errMsg)
+        sb.Append("<section class='alert-banner alert-banner--error'><svg width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='10'/><line x1='12' y1='8' x2='12' y2='12'/><line x1='12' y1='16' x2='12.01' y2='16'/></svg><span><strong>Ошибка:</strong> для возврата на корректировку необходимо указать комментарий для АРа.</span></section>");
+    if (errSp)
+        sb.Append("<section class='alert-banner alert-banner--error'><svg width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='10'/><line x1='12' y1='8' x2='12' y2='12'/><line x1='12' y1='16' x2='12.01' y2='16'/></svg><span><strong>Ошибка:</strong> укажите ID Смартплана.</span></section>");
+    sb.Append("<section class='card card--flush'><div class='table-wrap'><table class='table'><thead><tr>")
+      .Append("<th>№</th><th>Дисциплина</th><th>ОП</th><th>Год</th><th>Департамент</th><th>Статус</th><th>Действия</th>")
+      .Append("</tr></thead><tbody>");
+    var any = false;
+    await using (var r = await cmd.ExecuteReaderAsync())
+    {
+        while (await r.ReadAsync())
+        {
+            any = true;
+            var pdId = PlanRowReader.SafeReadInt32(r, 0);
+            var discNo = r.IsDBNull(1) ? "" : r.GetString(1);
+            var discName = r.IsDBNull(2) ? "" : r.GetString(2);
+            var ops = r.IsDBNull(3) ? "" : r.GetString(3);
+            var deptName = r.IsDBNull(4) ? "" : r.GetString(4);
+            var st = r.IsDBNull(5) ? "" : r.GetString(5);
+            var msg = r.IsDBNull(6) ? "" : r.GetString(6);
+            var spId = r.IsDBNull(7) ? "" : r.GetString(7);
+            var year = r.IsDBNull(8) ? "" : r.GetString(8);
+            var implDep = PlanRowReader.SafeReadInt32(r, 9);
+            var canAct = DisciplineApprovalPermissions.UserMayAccessDept(user, implDep);
+            sb.Append("<tr>")
+              .Append("<td>").Append(ParseHelpers.H(discNo)).Append("</td>")
+              .Append("<td>").Append(ParseHelpers.H(discName)).Append("</td>")
+              .Append("<td>").Append(ParseHelpers.H(ops)).Append("</td>")
+              .Append("<td>").Append(ParseHelpers.H(year)).Append("</td>")
+              .Append("<td>").Append(ParseHelpers.H(deptName)).Append("</td>")
+              .Append("<td>")
+              .Append(st?.Trim().ToLowerInvariant() switch {
+                  DisciplineWorkflow.Draft           => "<span class='badge badge--status badge--draft'>Черновик</span>",
+                  DisciplineWorkflow.Sent            => "<span class='badge badge--status badge--sent'>На согласовании</span>",
+                  DisciplineWorkflow.UnderReview     => "<span class='badge badge--status badge--review'>На рассмотрении</span>",
+                  DisciplineWorkflow.UnderCorrection => "<span class='badge badge--status badge--correction'>⚠ На корректировке</span>",
+                  DisciplineWorkflow.Rejected        => "<span class='badge badge--status badge--rejected'>✕ Отклонено</span>",
+                  DisciplineWorkflow.Approved        => "<span class='badge badge--status badge--approved'>✓ Согласовано</span>",
+                  _ => "<span class='badge badge--status badge--draft'>" + ParseHelpers.H(DisciplineWorkflow.StatusLabelRu(st)) + "</span>"
+              })
+              .Append(string.IsNullOrWhiteSpace(msg) ? "" : "<div class='hint' style='margin-top:4px'>" + ParseHelpers.H(msg) + "</div>")
+              .Append("</td>")
+              .Append("<td>");
+            if (!canAct)
+                sb.Append("<span class=\"hint\">—</span>");
+            else if (string.Equals(st, DisciplineWorkflow.Approved, StringComparison.OrdinalIgnoreCase))
+            {
+                var hasSmartplan = !string.IsNullOrWhiteSpace(spId?.Trim());
+                sb.Append("<div style=\"display:flex;flex-direction:column;gap:10px;max-width:320px\">");
+                if (!hasSmartplan)
+                {
+                    sb.Append("<form method=\"post\" action=\"/uidept-discipline-requests\" class=\"form form--row\" style=\"flex-wrap:wrap;gap:6px;align-items:center\">")
+                      .Append("<input type=\"hidden\" name=\"planDisciplineId\" value=\"").Append(pdId).Append("\" />")
+                      .Append("<input type=\"hidden\" name=\"workflowAction\" value=\"save_smartplan\" />")
+                      .Append("<input class=\"input input--sm\" name=\"smartplanId\" placeholder=\"ID Смартплан\" value=\"\" required />")
+                      .Append("<button type=\"submit\" class=\"btn btn--sm\">Сохранить ID</button>")
+                      .Append("</form>");
+                }
+                else
+                    sb.Append("<div class=\"hint\">В каталоге, ID Смартплан: <strong>").Append(ParseHelpers.H(spId)).Append("</strong></div>");
+                if (DisciplineApprovalPermissions.UserMayReworkApproved(user, implDep))
+                {
+                    sb.Append("<form method=\"post\" action=\"/uidept-discipline-requests\" class=\"form\" style=\"display:flex;flex-direction:column;gap:6px\" ")
+                      .Append("onsubmit=\"return confirm('Вы уверены, что хотите внести изменение в статус дисциплины? Это повлечёт за собой процедуру повторного согласования.');\">")
+                      .Append("<input type=\"hidden\" name=\"planDisciplineId\" value=\"").Append(pdId).Append("\" />")
+                      .Append("<input type=\"hidden\" name=\"workflowAction\" value=\"rework_approved\" />")
+                      .Append("<textarea class=\"input\" name=\"deptMessageToOp\" rows=\"2\" required placeholder=\"Комментарий для академического руководителя (обязательно)\"></textarea>")
+                      .Append("<button type=\"submit\" class=\"btn btn--sm btn--danger\">Вернуть на доработку</button>")
+                      .Append("</form>");
+                }
+                else if (user.IsAdmin)
+                    sb.Append("<div class=\"hint\">Возврат на доработку доступен менеджеру реализующего департамента.</div>");
+                sb.Append("</div>");
+            }
+            else
+            {
+                // sent / under_review / rejected — показываем кнопки действий
+                sb.Append("<form method=\"post\" action=\"/uidept-discipline-requests\" class=\"form\" style=\"display:flex;flex-direction:column;gap:6px;min-width:220px\">")
+                  .Append("<input type=\"hidden\" name=\"planDisciplineId\" value=\"").Append(pdId).Append("\" />")
+                  .Append("<textarea class=\"input\" name=\"deptMessageToOp\" rows=\"2\" placeholder=\"Комментарий для АРа (обязателен при «На корректировке»)\">").Append(ParseHelpers.H(msg)).Append("</textarea>")
+                  .Append("<div style=\"display:flex;flex-wrap:wrap;gap:4px\">")
+                  .Append("<button type=\"submit\" name=\"workflowAction\" value=\"review\" class=\"btn btn--sm btn--ghost\">На рассмотрении</button>")
+                  .Append("<button type=\"submit\" name=\"workflowAction\" value=\"reject\" class=\"btn btn--sm btn--danger\">Отклонить</button>")
+                  .Append("<button type=\"submit\" name=\"workflowAction\" value=\"correction\" class=\"btn btn--sm btn--ghost\">На корректировке</button>")
+                  .Append("<button type=\"submit\" name=\"workflowAction\" value=\"approve\" class=\"btn btn--sm\">Согласовать</button>")
+                  .Append("</div></form>");
+            }
+            sb.Append("</td></tr>");
+        }
+    }
+    if (!any)
+        sb.Append("<tr><td colspan=\"7\">Нет заявок в работе.</td></tr>");
+    sb.Append("</tbody></table></div></section>");
+    return Results.Content(Layout("Согласование дисциплин", "deptdisc", sb.ToString(), user.Login, user.IsAdmin, true, GetCsrfToken(ctx)), "text/html; charset=utf-8");
 });
 
-app.MapGet("/uiops", async (NpgsqlDataSource ds) =>
+app.MapPost("/uidept-discipline-requests", async (HttpContext ctx, NpgsqlDataSource ds) =>
 {
+    var user = await GetCurrentUser(ds, ctx.User);
+    if (user is null) return Results.Redirect("/login");
+    if (!user.CanReviewDisciplineRequests) return Results.Forbid();
+    var form = await ctx.Request.ReadFormAsync();
+    string Get(string key) => form[key].FirstOrDefault()?.Trim() ?? "";
+    var planDisciplineIdRaw = Get("planDisciplineId");
+    if (!int.TryParse(planDisciplineIdRaw, out var planDisciplineId) || planDisciplineId == 0)
+        return Results.Redirect("/uidept-discipline-requests");
+    var workflowAction = Get("workflowAction");
+    if (string.IsNullOrWhiteSpace(workflowAction))
+        return Results.Redirect("/uidept-discipline-requests");
+    var deptMessageToOp = Get("deptMessageToOp");
+    var smartplanId = Get("smartplanId");
+    var action = workflowAction.ToLowerInvariant();
+    await using var conn = await ds.OpenConnectionAsync();
+    int? implDept = null;
+    string? curStatus = null;
+    await using (var q = new NpgsqlCommand("SELECT implementing_department_id, dept_request_status FROM plan_disciplines WHERE plan_discipline_id = @id", conn))
+    {
+        q.Parameters.AddWithValue("id", NpgsqlDbType.Integer, planDisciplineId);
+        await using var rr = await q.ExecuteReaderAsync();
+        if (await rr.ReadAsync())
+        {
+            implDept = rr.IsDBNull(0) ? null : PlanRowReader.SafeReadInt32(rr, 0);
+            curStatus = rr.IsDBNull(1) ? null : rr.GetString(1);
+        }
+    }
+    if (implDept is null || !DisciplineApprovalPermissions.UserMayAccessDept(user, implDept.Value))
+        return Results.Redirect("/uidept-discipline-requests?err=forbid");
+
+    if (action == "save_smartplan")
+    {
+        if (string.IsNullOrWhiteSpace(smartplanId))
+            return Results.Redirect("/uidept-discipline-requests?err=smartplan");
+        await using var u = new NpgsqlCommand(@"
+UPDATE plan_disciplines SET smartplan_id = @sp
+WHERE plan_discipline_id = @id AND dept_request_status = 'approved'
+  AND (smartplan_id IS NULL OR TRIM(smartplan_id) = '');
+", conn);
+        u.Parameters.AddWithValue("sp", NpgsqlDbType.Varchar, smartplanId);
+        u.Parameters.AddWithValue("id", NpgsqlDbType.Integer, planDisciplineId);
+        var n = await u.ExecuteNonQueryAsync();
+        if (n == 0)
+            return Results.Redirect("/uidept-discipline-requests?err=smartplan_locked");
+        return Results.Redirect("/uidept-discipline-requests?saved=1");
+    }
+
+    if (action == "rework_approved")
+    {
+        if (!DisciplineApprovalPermissions.UserMayReworkApproved(user, implDept.Value))
+            return Results.Redirect("/uidept-discipline-requests?err=forbid");
+        if (!string.Equals(curStatus, DisciplineWorkflow.Approved, StringComparison.OrdinalIgnoreCase))
+            return Results.Redirect("/uidept-discipline-requests");
+        if (string.IsNullOrWhiteSpace(deptMessageToOp))
+            return Results.Redirect("/uidept-discipline-requests?err=msg");
+        await using var u = new NpgsqlCommand(@"
+UPDATE plan_disciplines
+SET dept_request_status = 'under_correction',
+    dept_message_to_op = @msg,
+    smartplan_id = NULL
+WHERE plan_discipline_id = @id AND dept_request_status = 'approved';
+", conn);
+        u.Parameters.AddWithValue("msg", NpgsqlDbType.Text, deptMessageToOp);
+        u.Parameters.AddWithValue("id", NpgsqlDbType.Integer, planDisciplineId);
+        await u.ExecuteNonQueryAsync();
+        return Results.Redirect("/uidept-discipline-requests?rework=1");
+    }
+
+    if (!string.Equals(curStatus, DisciplineWorkflow.Sent, StringComparison.OrdinalIgnoreCase)
+        && !string.Equals(curStatus, DisciplineWorkflow.UnderReview, StringComparison.OrdinalIgnoreCase)
+        && !string.Equals(curStatus, DisciplineWorkflow.UnderCorrection, StringComparison.OrdinalIgnoreCase)
+        && !string.Equals(curStatus, DisciplineWorkflow.Rejected, StringComparison.OrdinalIgnoreCase))
+        return Results.Redirect("/uidept-discipline-requests");
+
+    switch (action)
+    {
+        case "review":
+            await using (var u = new NpgsqlCommand("UPDATE plan_disciplines SET dept_request_status = 'under_review' WHERE plan_discipline_id = @id", conn))
+            {
+                u.Parameters.AddWithValue("id", NpgsqlDbType.Integer, planDisciplineId);
+                await u.ExecuteNonQueryAsync();
+            }
+            break;
+        case "reject":
+            await using (var u = new NpgsqlCommand("UPDATE plan_disciplines SET dept_request_status = 'rejected', dept_message_to_op = @msg WHERE plan_discipline_id = @id", conn))
+            {
+                u.Parameters.AddWithValue("msg", NpgsqlDbType.Text, string.IsNullOrWhiteSpace(deptMessageToOp) ? (object)DBNull.Value : deptMessageToOp);
+                u.Parameters.AddWithValue("id", NpgsqlDbType.Integer, planDisciplineId);
+                await u.ExecuteNonQueryAsync();
+            }
+            break;
+        case "correction":
+            if (string.IsNullOrWhiteSpace(deptMessageToOp))
+                return Results.Redirect("/uidept-discipline-requests?err=msg");
+            await using (var u = new NpgsqlCommand(@"
+UPDATE plan_disciplines SET dept_request_status = 'under_correction', dept_message_to_op = @msg WHERE plan_discipline_id = @id", conn))
+            {
+                u.Parameters.AddWithValue("msg", NpgsqlDbType.Text, deptMessageToOp);
+                u.Parameters.AddWithValue("id", NpgsqlDbType.Integer, planDisciplineId);
+                await u.ExecuteNonQueryAsync();
+            }
+            break;
+        case "approve":
+            await using (var u = new NpgsqlCommand(@"
+UPDATE plan_disciplines SET dept_request_status = 'approved', dept_message_to_op = NULL WHERE plan_discipline_id = @id", conn))
+            {
+                u.Parameters.AddWithValue("id", NpgsqlDbType.Integer, planDisciplineId);
+                await u.ExecuteNonQueryAsync();
+            }
+            break;
+        default:
+            return Results.Redirect("/uidept-discipline-requests");
+    }
+    return Results.Redirect("/uidept-discipline-requests?saved=1");
+}).DisableAntiforgery();
+
+app.MapGet("/uiops", async (HttpContext ctx, NpgsqlDataSource ds) =>
+{
+    var user = await GetCurrentUser(ds, ctx.User);
+    if (user is null) return Results.Redirect("/login");
     await using var conn = await ds.OpenConnectionAsync();
     await using var cmd = new NpgsqlCommand(@"
         SELECT op_id, name, education_level, study_format 
@@ -3621,11 +5106,7 @@ app.MapGet("/uiops", async (NpgsqlDataSource ds) =>
 
     var sb = new StringBuilder();
     sb.Append("<h1 class='h1'>Образовательные программы</h1>");
-    sb.Append("<section class='card card--flush'>")
-      .Append("<form method='post' action='/uifaculty/save-batch-form'>")
-      .Append("<div class='toolbar'>")
-      .Append("<button class='btn' type='submit'>Сохранить все</button>")
-      .Append("</div>");
+    sb.Append("<section class='card card--flush'>");
     sb.Append("<div class='table-wrap'><table class='table'>");
     sb.Append("<thead><tr><th>ID</th><th>Название</th><th>Уровень</th><th>Формат</th></tr></thead><tbody>");
 
@@ -3641,7 +5122,7 @@ app.MapGet("/uiops", async (NpgsqlDataSource ds) =>
     }
     sb.Append("</tbody></table></div></section>");
 
-    return Results.Content(Layout("ОП", "ops", sb.ToString()), "text/html; charset=utf-8");
+    return Results.Content(Layout("ОП", "ops", sb.ToString(), user.Login, user.IsAdmin, user.CanReviewDisciplineRequests, GetCsrfToken(ctx)), "text/html; charset=utf-8");
 });
 
 app.MapGet("/uifaculty", async (
@@ -3663,7 +5144,9 @@ app.MapGet("/uifaculty", async (
     string[]? moduleNo,
     string? sortBy,
     string? sortOrder,
-    string? importError
+    string? importError,
+    string? err,
+    string? saveError
 ) =>
 {
     var user = await GetCurrentUser(ds, ctx.User);
@@ -3737,23 +5220,32 @@ app.MapGet("/uifaculty", async (
       .Append("<div class='page-subtitle'>Управление преподавателями и их данными</div>")
       .Append("</div>")
       .Append("</section>");
-    if (!string.IsNullOrEmpty(importError))
-      sb.Append("<section class='card'><p class='").Append(importError == "noFile" ? "hint" : "error").Append("'>")
-        .Append(importError == "noFile" ? "Выберите файл Excel для загрузки." : ParseHelpers.H(importError))
-        .Append("</p></section>");
+    var facultyErrorMessage = default(string);
+    if (!string.IsNullOrEmpty(saveError))
+      facultyErrorMessage = saveError;
+    else if (!string.IsNullOrEmpty(importError))
+      facultyErrorMessage = importError == "noFile" ? "Выберите файл Excel для загрузки." : importError;
+    else if (err == "faculty_dup")
+      facultyErrorMessage = "Преподаватель с таким ФИО уже заведён в выбранном департаменте. Разные департаменты — разные записи.";
+    if (!string.IsNullOrWhiteSpace(facultyErrorMessage))
+      sb.Append("<script>document.addEventListener('DOMContentLoaded',function(){if(window.__showErrorDialog){window.__showErrorDialog(")
+        .Append(JsonSerializer.Serialize(facultyErrorMessage))
+        .Append(",")
+        .Append(JsonSerializer.Serialize("Ошибка сохранения"))
+        .Append(");}});</script>");
 
     sb.Append("<section class='card'>")
       .Append("<div class='toolbar'>");
     if (user.CanEditFaculty)
     {
-      sb.Append("<button class='btn' type='submit' form='pps-batch-form'>Сохранить все</button>")
-        .Append("<button class='btn btn--danger' type='button' data-delete-selected='pps'>Удалить выбранные</button>")
-        .Append("<button class='btn btn--ghost' type='button' data-pps-add>Добавить строку</button>");
+      sb.Append($"<button class='btn' type='submit' form='pps-batch-form'>{IconSave} Сохранить все</button>")
+        .Append($"<button class='btn btn--danger' type='button' data-delete-selected='pps'>{IconDelete} Удалить выбранные</button>")
+        .Append($"<button class='btn btn--ghost' type='button' data-pps-add>{IconAdd} Добавить строку</button>");
     }
     else
       sb.Append("<span class=\"hint\">Только просмотр. Редактирование: менеджер департамента или администратор.</span>");
-    sb.Append("<button class='btn btn--ghost' type='button' data-dialog-open='#pps-filter'>Фильтр</button>")
-      .Append("<button class='btn btn--ghost' type='button' onclick=\"window.location.href='/uifaculty'\">Сброс</button>");
+    sb.Append($"<button class='btn btn--ghost' type='button' data-dialog-open='#pps-filter'>{IconFilter} Фильтр</button>")
+      .Append($"<button class='btn btn--ghost' type='button' onclick=\"window.location.href='/uifaculty'\">{IconReset} Сброс</button>");
     var ppsSortBase = "/uifaculty?" + (string.IsNullOrEmpty(redirectQuery) ? "" : redirectQuery + "&");
     sb.Append("<span class=\"toolbar-sort\"><label class=\"hint\" style=\"margin-right:6px\">Сортировка:</label>")
       .Append("<select class=\"input input--sm\" style=\"width:auto;display:inline-block\" onchange=\"window.location=this.value\" aria-label=\"Сортировка\">")
@@ -3767,7 +5259,7 @@ app.MapGet("/uifaculty", async (
     if (user.CanEditFaculty)
       sb.Append("<span class=\"toolbar-import\"><form method='post' action='/uifaculty/import' enctype='multipart/form-data'>")
         .Append("<input type='hidden' name='redirectQuery' value='").Append(ParseHelpers.H(redirectQuery)).Append("'>")
-        .Append("<label class='btn btn--ghost btn--file'><input type='file' name='file' accept='.xlsx,.xls' required>Выберите файл</label>")
+        .Append("<label class='btn btn--ghost btn--file'><input type='file' name='file' accept='.xlsx,.xls' required>").Append(IconImport).Append(" Выберите файл</label>")
         .Append("<button type='submit' class='btn btn--ghost'>Загрузить из Excel</button>")
         .Append("</form></span>");
     sb.Append("</div>")
@@ -3810,45 +5302,27 @@ app.MapGet("/uifaculty", async (
 
     sb.Append("<section class='card card--flush'>")
       .Append("<form id='pps-batch-form' method='post' action='/uifaculty/save-batch-form'>")
-      .Append("<div class='toolbar'>")
-      .Append("<button class='btn btn--ghost' type='button' data-filter-clear='#pps-table'>Сбросить фильтры</button>")
-      .Append("</div>");
+;
     sb.Append("<select id='pps-department-options' class='input' style='display:none'>")
       .Append(OptionsListStrings(departmentOptions.Concat(new[] { "Другое" }), null, "Департамент"))
       .Append("</select>");
-    sb.Append("<div class='table-filter-bar' data-filter-table='#pps-table'>")
-      .Append("<input class='input input--filter' data-filter-col='0' placeholder='Выбор' style='width:4rem'>")
-      .Append("<input class='input input--filter' data-filter-col='1' placeholder='№'>")
-      .Append("<input class='input input--filter' data-filter-col='2' placeholder='ФИО'>")
-      .Append("<input class='input input--filter' data-filter-col='3' placeholder='Должность'>")
-      .Append("<input class='input input--filter' data-filter-col='4' placeholder='Ставка'>")
-      .Append("<input class='input input--filter' data-filter-col='5' placeholder='НРД (доля)'>")
-      .Append("<input class='input input--filter' data-filter-col='6' placeholder='Трек'>")
-      .Append("<input class='input input--filter' data-filter-col='7' placeholder='Департамент'>")
-      .Append("<input class='input input--filter' data-filter-col='8' placeholder='Тип занятости'>")
-      .Append("<input class='input input--filter' data-filter-col='9' placeholder='Аудит. нагрузка'>")
-      .Append("<input class='input input--filter' data-filter-col='10' placeholder='Норма часов'>")
-      .Append("<input class='input input--filter' data-filter-col='11' placeholder='Выполняемая'>")
-      .Append("<input class='input input--filter' data-filter-col='12' placeholder='Ответственный'>")
-      .Append("<input class='input input--filter' data-filter-col='13' placeholder='Активен'>")
-      .Append("</div>");
     var canEditPps = user.CanEditFaculty;
     sb.Append("<div class='table-scroll-top'><div class='table-scroll-bar' role='scrollbar' aria-orientation='horizontal'><div class='table-scroll-bar__inner'></div></div><div class='table-wrap'><table id='pps-table' class='table' data-table-filter='pps'>");
     sb.Append("<thead><tr>")
       .Append("<th><input type='checkbox' data-select-all='pps' aria-label='Выбрать все'").Append(canEditPps ? ">" : " disabled>").Append("</th>")
-      .Append("<th>№</th>")
-      .Append("<th>ФИО</th>")
-      .Append("<th>Должность</th>")
-      .Append("<th>Ставка</th>")
-      .Append("<th>НРД (доля)</th>")
-      .Append("<th>Трек</th>")
-      .Append("<th>Департамент</th>")
-      .Append("<th>Тип занятости</th>")
-      .Append("<th>Аудиторная нагрузка 2025/2026</th>")
-      .Append("<th>Норма часов для трека и ставки</th>")
-      .Append("<th>Выполняемая для аудиторной нагрузки</th>")
-      .Append("<th>Аудиторная нагрузка (ответственный)</th>")
-      .Append("<th>Активен</th>")
+      .Append("<th>№ <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>ФИО <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Должность <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Ставка <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>НРД (доля) <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Трек <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Департамент <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Тип занятости <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Аудиторная нагрузка 2025/2026 <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Норма часов для трека и ставки <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Выполняемая для аудиторной нагрузки <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Аудиторная нагрузка (ответственный) <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Активен <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
       .Append("</tr></thead><tbody>");
 
     await using var r = await cmd.ExecuteReaderAsync();
@@ -3910,7 +5384,7 @@ app.MapGet("/uifaculty", async (
     }
     sb.Append("</tbody></table></div></div></form></section>");
 
-    return Results.Content(Layout("Преподаватели", "faculty", sb.ToString(), user.Login, user.IsAdmin), "text/html; charset=utf-8");
+    return Results.Content(Layout("Преподаватели", "faculty", sb.ToString(), user.Login, user.IsAdmin, user.CanReviewDisciplineRequests, GetCsrfToken(ctx)), "text/html; charset=utf-8");
 });
 
 app.MapGet("/uifaculty/export", async (HttpContext ctx, NpgsqlDataSource ds, string[]? departmentId) =>
@@ -3923,8 +5397,6 @@ app.MapGet("/uifaculty/export", async (HttpContext ctx, NpgsqlDataSource ds, str
         var allowedDept = new HashSet<int>(user.AllowedDepartmentIds);
         departmentIds = departmentIds.Length == 0 ? user.AllowedDepartmentIds : departmentIds.Where(d => allowedDept.Contains(d)).ToArray();
     }
-    if (!user.IsAdmin && user.AllowedDepartmentIds.Length == 0)
-        departmentIds = new[] { -1 };
     var ppsExportDepartmentIdsParam = departmentIds.Length == 0 ? (object?)null : departmentIds;
     await using var conn = await ds.OpenConnectionAsync();
     await using var cmd = new NpgsqlCommand(@"
@@ -4026,6 +5498,7 @@ app.MapPost("/uifaculty/import", async (HttpContext ctx, NpgsqlDataSource ds, Ht
     var trackOptions = new HashSet<string>(new[] { "Академический", "Образовательно-методический", "Практико-ориентированный" });
     var departmentOptions = new HashSet<string>(defaultDepartmentNames);
     var errors = new List<string>();
+    var importPairsSeen = new HashSet<(string norm, int deptKey)>();
     await using var conn = await ds.OpenConnectionAsync();
     await using var tx = await conn.BeginTransactionAsync();
     async Task<int?> ResolveDepartmentId(string name)
@@ -4044,6 +5517,7 @@ app.MapPost("/uifaculty/import", async (HttpContext ctx, NpgsqlDataSource ds, Ht
     {
         var fullName = ExcelImportHelper.Get(row, "full_name");
         if (string.IsNullOrWhiteSpace(fullName)) { rowNum++; continue; }
+        fullName = fullName.Trim();
         var noStr = ExcelImportHelper.Get(row, "no");
         var facultyId = ParseHelpers.IntOrNull(noStr);
         var position = ExcelImportHelper.Get(row, "position");
@@ -4065,7 +5539,24 @@ app.MapPost("/uifaculty/import", async (HttpContext ctx, NpgsqlDataSource ds, Ht
         if (!trackOptions.Contains(track)) track = "Академический";
         int? departmentId = null;
         if (!string.IsNullOrWhiteSpace(departmentName))
-            departmentId = await ResolveDepartmentId(departmentName);
+            departmentId = await ResolveDepartmentId(departmentName.Trim());
+        int? effDept = departmentId;
+        if (facultyId is not null)
+        {
+            await using var curD = new NpgsqlCommand("SELECT department_id FROM faculty_members WHERE faculty_id = @id", conn, tx);
+            curD.Parameters.AddWithValue("id", NpgsqlDbType.Integer, facultyId.Value);
+            var oldD = await curD.ExecuteScalarAsync();
+            int? oldDept = oldD is int od ? od : null;
+            effDept = departmentId ?? oldDept;
+        }
+        var pairKey = (fullName.ToLowerInvariant(), effDept.HasValue ? effDept.Value : -1);
+        var errBeforeRow = errors.Count;
+        if (!importPairsSeen.Add(pairKey))
+            errors.Add($"Строка Excel {rowNum}: повторяется пара ФИО и департамент.");
+        else if (await FacultyNameDepartmentTaken(conn, tx, fullName, effDept, facultyId))
+            errors.Add($"Строка Excel {rowNum}: преподаватель «{fullName}» уже есть в этом департаменте (проверьте № или департамент).");
+        if (errors.Count > errBeforeRow) { rowNum++; continue; }
+
         if (facultyId is null)
         {
             await using var insert = new NpgsqlCommand(@"
@@ -4108,6 +5599,13 @@ WHERE faculty_id = @facultyId;", conn, tx);
         }
         rowNum++;
     }
+    if (errors.Count > 0)
+    {
+        await tx.RollbackAsync();
+        var q = redirectQuery;
+        var sep = string.IsNullOrEmpty(q) ? "?" : q.Contains('?') ? q + "&" : "?" + q + "&";
+        return Results.Redirect("/uifaculty" + sep + "importError=" + Uri.EscapeDataString(string.Join(" ", errors)));
+    }
     await tx.CommitAsync();
     return Results.Redirect("/uifaculty" + (string.IsNullOrEmpty(redirectQuery) ? "" : redirectQuery));
 }).DisableAntiforgery();
@@ -4139,9 +5637,12 @@ app.MapPost("/uifaculty/save", async (
 
     await using var conn = await ds.OpenConnectionAsync();
     var isActiveValue = ParseHelpers.BoolOrNull(isActive);
+    var nameTrim = ppsName.Trim();
 
     if (facultyIdValue is null)
     {
+        if (await FacultyNameDepartmentTaken(conn, null, nameTrim, departmentId, null))
+            return Results.Redirect("/uifaculty?err=faculty_dup");
         await using var insert = new NpgsqlCommand(@"
 INSERT INTO faculty_members (
     full_name, department_id, is_active, position, rate, nrd_share, zero_out_total,
@@ -4152,7 +5653,7 @@ VALUES (
     @track, @auditoryLoad, @normHours, @performedLoad, @responsibleLoad
 );
 ", conn);
-        insert.Parameters.AddWithValue("fullName", NpgsqlDbType.Text, ppsName);
+        insert.Parameters.AddWithValue("fullName", NpgsqlDbType.Text, nameTrim);
         insert.Parameters.AddWithValue("position", NpgsqlDbType.Text, (object?)position ?? DBNull.Value);
         insert.Parameters.AddWithValue("rate", NpgsqlDbType.Numeric, (object?)rate ?? DBNull.Value);
         insert.Parameters.AddWithValue("nrd", NpgsqlDbType.Numeric, (object?)nrdShare ?? DBNull.Value);
@@ -4168,6 +5669,15 @@ VALUES (
     }
     else
     {
+        int? deptForUniq = departmentId;
+        await using (var curU = new NpgsqlCommand("SELECT department_id FROM faculty_members WHERE faculty_id = @id", conn))
+        {
+            curU.Parameters.AddWithValue("id", NpgsqlDbType.Integer, facultyIdValue.Value);
+            var d = await curU.ExecuteScalarAsync();
+            if (deptForUniq is null && d is int exD) deptForUniq = exD;
+        }
+        if (await FacultyNameDepartmentTaken(conn, null, nameTrim, deptForUniq, facultyIdValue))
+            return Results.Redirect("/uifaculty?err=faculty_dup");
         await using var cmd = new NpgsqlCommand(@"
 UPDATE faculty_members
 SET full_name = COALESCE(@fullName, full_name),
@@ -4227,11 +5737,14 @@ app.MapPost("/uifaculty/save-raw", async (HttpContext ctx, NpgsqlDataSource ds, 
         return Results.BadRequest("ppsName required");
 
     var isActiveValue = ParseHelpers.BoolOrNull(isActive);
+    var nameTrim = ppsName.Trim();
 
     await using var conn = await ds.OpenConnectionAsync();
 
     if (ppsNo is null)
     {
+        if (await FacultyNameDepartmentTaken(conn, null, nameTrim, departmentId, null))
+            return Results.BadRequest("duplicate name+department");
         await using var insert = new NpgsqlCommand(@"
 INSERT INTO faculty_members (
     full_name, department_id, is_active, position, rate, nrd_share, zero_out_total,
@@ -4242,7 +5755,7 @@ VALUES (
     @track, @auditoryLoad, @normHours, @performedLoad, @responsibleLoad
 );
 ", conn);
-        insert.Parameters.AddWithValue("fullName", NpgsqlDbType.Text, ppsName);
+        insert.Parameters.AddWithValue("fullName", NpgsqlDbType.Text, nameTrim);
         insert.Parameters.AddWithValue("position", NpgsqlDbType.Text, (object?)position ?? DBNull.Value);
         insert.Parameters.AddWithValue("rate", NpgsqlDbType.Numeric, (object?)rate ?? DBNull.Value);
         insert.Parameters.AddWithValue("nrd", NpgsqlDbType.Numeric, (object?)nrdShare ?? DBNull.Value);
@@ -4258,6 +5771,15 @@ VALUES (
     }
     else
     {
+        int? deptForUniq = departmentId;
+        await using (var curU = new NpgsqlCommand("SELECT department_id FROM faculty_members WHERE faculty_id = @id", conn))
+        {
+            curU.Parameters.AddWithValue("id", NpgsqlDbType.Integer, ppsNo.Value);
+            var d = await curU.ExecuteScalarAsync();
+            if (deptForUniq is null && d is int exD) deptForUniq = exD;
+        }
+        if (await FacultyNameDepartmentTaken(conn, null, nameTrim, deptForUniq, ppsNo))
+            return Results.BadRequest("duplicate name+department");
         await using var cmd = new NpgsqlCommand(@"
 UPDATE faculty_members
 SET full_name = COALESCE(@fullName, full_name),
@@ -4315,11 +5837,13 @@ app.MapPost("/uifaculty/save-batch-form", async (HttpContext ctx, NpgsqlDataSour
     await using var conn = await ds.OpenConnectionAsync();
     await using var tx = await conn.BeginTransactionAsync();
     var errors = new List<string>();
+    var batchPairsSeen = new HashSet<(string norm, int deptKey)>();
 
     foreach (var rowKey in rowKeys)
     {
         if (string.IsNullOrWhiteSpace(rowKey)) continue;
         var facultyId = ParseHelpers.IntOrNull(rowKey);
+        var errBeforeRow = errors.Count;
 
         string? GetText(string key)
         {
@@ -4370,8 +5894,10 @@ app.MapPost("/uifaculty/save-batch-form", async (HttpContext ctx, NpgsqlDataSour
         else if (rate is not null && nrdShare > rate)
             errors.Add($"НРД не может быть больше ставки (строка {rowKey})");
 
-        if (string.IsNullOrWhiteSpace(track) || !trackOptions.Contains(track))
+        var isGph = string.Equals(employmentType?.Trim(), "ГПХ", StringComparison.OrdinalIgnoreCase);
+        if (!isGph && (string.IsNullOrWhiteSpace(track) || !trackOptions.Contains(track)))
             errors.Add($"Трек обязателен (строка {rowKey})");
+        if (isGph) track = null;
 
         string? finalDepartmentName = null;
         if (string.IsNullOrWhiteSpace(departmentName))
@@ -4396,7 +5922,7 @@ app.MapPost("/uifaculty/save-batch-form", async (HttpContext ctx, NpgsqlDataSour
             errors.Add($"Недопустимый департамент (строка {rowKey})");
         }
 
-        if (errors.Count > 0) continue;
+        if (errors.Count > errBeforeRow) continue;
 
         async Task<int?> ResolveDepartmentId(string name)
         {
@@ -4416,6 +5942,14 @@ app.MapPost("/uifaculty/save-batch-form", async (HttpContext ctx, NpgsqlDataSour
         }
 
         var departmentId = finalDepartmentName is null ? (int?)null : await ResolveDepartmentId(finalDepartmentName);
+
+        var deptKeyUniq = departmentId.HasValue ? departmentId.Value : -1;
+        var normUniq = ppsName.Trim().ToLowerInvariant();
+        if (!batchPairsSeen.Add((normUniq, deptKeyUniq)))
+            errors.Add($"Дублируется ФИО и департамент в сохраняемой форме (строка {rowKey}).");
+        else if (await FacultyNameDepartmentTaken(conn, tx, ppsName, departmentId, facultyId))
+            errors.Add($"Уже есть преподаватель с таким ФИО в этом департаменте (строка {rowKey}).");
+        if (errors.Count > errBeforeRow) continue;
 
         if (facultyId is null)
         {
@@ -4452,7 +5986,7 @@ SET full_name = COALESCE(@fullName, full_name),
     position = COALESCE(@position, position),
     rate = COALESCE(@rate, rate),
     nrd_share = COALESCE(@nrd, nrd_share),
-    track = COALESCE(@track, track),
+    track = @track,
     department_id = COALESCE(@departmentId, department_id),
     employment_type = @employmentType,
     is_active = @isActive,
@@ -4482,11 +6016,11 @@ WHERE faculty_id = @facultyId;
     if (errors.Count > 0)
     {
         await tx.RollbackAsync();
-        return Results.BadRequest(string.Join("\n", errors));
+        return Results.Redirect("/uifaculty?saveError=" + Uri.EscapeDataString(string.Join("\n", errors)));
     }
 
     await tx.CommitAsync();
-    return Results.Redirect("/uifaculty");
+    return Results.Redirect("/uifaculty?saved=1");
 }).DisableAntiforgery();
 
 app.MapPost("/uifaculty/delete", async (HttpContext ctx, NpgsqlDataSource ds, int? facultyId) =>
@@ -4501,7 +6035,7 @@ app.MapPost("/uifaculty/delete", async (HttpContext ctx, NpgsqlDataSource ds, in
         conn);
     cmd.Parameters.AddWithValue("id", NpgsqlDbType.Integer, facultyId.Value);
     await cmd.ExecuteNonQueryAsync();
-    return Results.Redirect("/uifaculty");
+    return Results.Redirect("/uifaculty?deleted=1");
 });
 
 app.MapPost("/uifaculty/delete-batch", async (HttpContext ctx, NpgsqlDataSource ds, int[]? facultyIds) =>
@@ -4517,10 +6051,10 @@ app.MapPost("/uifaculty/delete-batch", async (HttpContext ctx, NpgsqlDataSource 
         cmd.Parameters.AddWithValue("id", NpgsqlDbType.Integer, id);
         await cmd.ExecuteNonQueryAsync();
     }
-    return Results.Redirect("/uifaculty");
+    return Results.Redirect("/uifaculty?deleted=1");
 });
 
-app.MapGet("/uidisciplines", async (HttpContext ctx, NpgsqlDataSource ds, string? q, string[]? departmentId, string[]? moduleNo, string? sortBy, string? sortOrder, string? importError) =>
+app.MapGet("/uidisciplines", async (HttpContext ctx, NpgsqlDataSource ds, string? q, string[]? departmentId, string[]? moduleNo, string? sortBy, string? sortOrder, string? importError, string? err) =>
 {
     var user = await GetCurrentUser(ds, ctx.User);
     if (user is null) return Results.Redirect("/login");
@@ -4552,7 +6086,10 @@ SELECT
   COUNT(DISTINCT pd.implementing_department_id) AS depts,
   COALESCE(SUM(pd.credits), 0) AS total_credits
 FROM plan_disciplines pd
-WHERE (@q IS NULL OR pd.discipline_name ILIKE @q OR pd.discipline_no ILIKE @q);", conn))
+WHERE (@q IS NULL OR pd.discipline_name ILIKE @q OR pd.discipline_no ILIKE @q)
+  AND pd.dept_request_status = 'approved'
+  AND pd.smartplan_id IS NOT NULL
+  AND BTRIM(pd.smartplan_id) <> '';", conn))
     {
         statsCmd.Parameters.AddWithValue("q", NpgsqlDbType.Text, (object?)qLike ?? DBNull.Value);
         await using var sr = await statsCmd.ExecuteReaderAsync();
@@ -4575,13 +6112,18 @@ SELECT
   pd.course_no,
   pd.discipline_kind::text,
   pd.language,
-  pd.credits
+  pd.credits,
+  pd.module_numbers,
+  pd.smartplan_id
 FROM plan_disciplines pd
 LEFT JOIN plan_modules pm ON pd.module_id = pm.module_id
 LEFT JOIN departments d ON pd.implementing_department_id = d.department_id
 WHERE (@q IS NULL OR pd.discipline_name ILIKE @q OR pd.discipline_no ILIKE @q) AND
   (@departmentIds IS NULL OR array_length(@departmentIds, 1) IS NULL OR pd.implementing_department_id = ANY(@departmentIds)) AND
-  (@moduleNos IS NULL OR array_length(@moduleNos, 1) IS NULL OR pm.module_number = ANY(@moduleNos))
+  (@moduleNos IS NULL OR array_length(@moduleNos, 1) IS NULL OR pm.module_number = ANY(@moduleNos)) AND
+  pd.dept_request_status = 'approved'
+  AND pd.smartplan_id IS NOT NULL
+  AND BTRIM(pd.smartplan_id) <> ''
 ORDER BY " + GetDisciplinesOrderBy(sortBy, sortOrder) + @"
 LIMIT 500;", conn);
     var discDepartmentIdsParam = departmentIds.Length == 0 ? (object?)null : departmentIds;
@@ -4594,7 +6136,7 @@ LIMIT 500;", conn);
     sb.Append("<section class='page-header'>")
       .Append("<div>")
       .Append("<h1 class='page-title'>Дисциплины</h1>")
-      .Append("<div class='page-subtitle'>Список формируется из учебного плана: дисциплины, добавленные в разделе <a href='/uiplan' class='link'>Учебный план</a>, автоматически отображаются здесь</div>")
+      .Append("<div class='page-subtitle'>Здесь только дисциплины, прошедшие согласование с департаментом и внесённые в Смартплан (есть ID). Подготовка — в <a href='/uiplan' class='link'>Учебном плане</a>, согласование — в разделе «Согласование дисциплин».</div>")
       .Append("</div>")
       .Append("</section>");
 
@@ -4607,18 +6149,20 @@ LIMIT 500;", conn);
       sb.Append("<section class='card'><p class='").Append(importError == "noFile" ? "hint" : "error").Append("'>")
         .Append(importError == "noFile" ? "Выберите файл Excel для загрузки." : ParseHelpers.H(importError))
         .Append("</p></section>");
+    if (string.Equals(err, "approved_delete", StringComparison.OrdinalIgnoreCase))
+      sb.Append("<section class='card'><p class='error'>Согласованные дисциплины нельзя удалять. Чтобы внести изменения, департамент может вернуть строку на доработку в разделе «Согласование дисциплин» (это запустит повторное согласование).</p></section>");
     sb.Append("<section class='card'>")
       .Append("<div class='toolbar'>");
     if (user.CanEditDisciplines)
     {
-      sb.Append("<button class='btn' type='submit' form='disc-batch-form'>Сохранить все</button>")
-        .Append("<button class='btn btn--danger' type='button' data-delete-selected='disc'>Удалить выбранные</button>")
-        .Append("<button class='btn btn--ghost' type='button' data-disc-add>Добавить строку</button>");
+      sb.Append($"<button class='btn' type='submit' form='disc-batch-form'>{IconSave} Сохранить все</button>")
+        .Append($"<button class='btn btn--danger' type='button' data-delete-selected='disc'>{IconDelete} Удалить выбранные</button>")
+        .Append($"<button class='btn btn--ghost' type='button' data-disc-add>{IconAdd} Добавить строку</button>");
     }
     else
-      sb.Append("<span class=\"hint\">Только просмотр. Редактирование: менеджер департамента или администратор.</span>");
-    sb.Append("<button class='btn btn--ghost' type='button' data-dialog-open='#disc-filter'>Фильтр</button>")
-      .Append("<button class='btn btn--ghost' type='button' onclick=\"window.location.href='/uidisciplines'\">Сброс</button>");
+      sb.Append("<span class=\"hint\">Только просмотр. Редактирование: академический руководитель или администратор.</span>");
+    sb.Append($"<button class='btn btn--ghost' type='button' data-dialog-open='#disc-filter'>{IconFilter} Фильтр</button>")
+      .Append($"<button class='btn btn--ghost' type='button' onclick=\"window.location.href='/uidisciplines'\">{IconReset} Сброс</button>");
     var discSortBase = "/uidisciplines?" + (string.IsNullOrEmpty(redirectQuery) ? "" : redirectQuery + "&");
     sb.Append("<span class=\"toolbar-sort\"><label class=\"hint\" style=\"margin-right:6px\">Сортировка:</label>")
       .Append("<select class=\"input input--sm\" style=\"width:auto;display:inline-block\" onchange=\"window.location=this.value\" aria-label=\"Сортировка\">")
@@ -4635,11 +6179,11 @@ LIMIT 500;", conn);
       sb.Append("<span class=\"toolbar-import\"><form method='post' action='/uidisciplines/import' enctype='multipart/form-data'>")
         .Append("<input type='hidden' name='redirectQuery' value='").Append(ParseHelpers.H(redirectQuery)).Append("'>")
         .Append("<input type='hidden' name='planId' value='").Append(planIdDefault).Append("'>")
-        .Append("<label class='btn btn--ghost btn--file'><input type='file' name='file' accept='.xlsx,.xls' required>Выберите файл</label>")
+        .Append("<label class='btn btn--ghost btn--file'><input type='file' name='file' accept='.xlsx,.xls' required>").Append(IconImport).Append(" Выберите файл</label>")
         .Append("<button type='submit' class='btn btn--ghost'>Загрузить из Excel</button>")
         .Append("</form></span>");
     sb.Append("</div>")
-      .Append("<p class='hint'>Новые дисциплины добавляются в <a href='/uiplan' class='link'>Учебный план</a> — они автоматически появятся в этом списке.</p>")
+      .Append("<p class='hint'>Добавление в каталог — после согласования и ID Смартплан; черновики ведутся в <a href='/uiplan' class='link'>Учебном плане</a>.</p>")
       .Append("<div class='hint'>Показано до 500 строк</div>")
       .Append("</section>");
 
@@ -4685,6 +6229,7 @@ LIMIT 500;", conn);
       .Append("</select>")
       .Append("<select id='disc-dept-options' class='input' style='display:none'>")
       .Append(OptionsList(departments, null, "Департамент"))
+      .Append("<option value=\"-1\">Другое</option>")
       .Append("</select>")
       .Append("<select id='disc-disciplinekind-options' class='input' style='display:none'>")
       .Append(OptionsListStrings(SelectOptions.DisciplineKinds, null, "Вид"))
@@ -4696,14 +6241,15 @@ LIMIT 500;", conn);
     var canEditDisc = user.CanEditDisciplines;
     sb.Append("<div class='table-scroll-top'><div class='table-scroll-bar' role='scrollbar' aria-orientation='horizontal'><div class='table-scroll-bar__inner'></div></div><div class='table-wrap'><table class='table'><thead><tr>")
       .Append("<th><input type='checkbox' data-select-all='disc' aria-label='Выбрать все'").Append(canEditDisc ? ">" : " disabled>").Append("</th>")
-      .Append("<th>№ дисциплины</th>")
-      .Append("<th>Наименование дисциплины</th>")
-      .Append("<th>Модуль</th>")
-      .Append("<th>Департамент</th>")
-      .Append("<th>Курс</th>")
-      .Append("<th>Вид дисциплины</th>")
-      .Append("<th>Язык</th>")
-      .Append("<th>Зач.ед.</th>")
+      .Append("<th>№ дисциплины <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Наименование дисциплины <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Модуль <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Департамент <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Курс <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Вид дисциплины <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Язык <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>Зач.ед. <button type='button' class='btn-filter-excel' title='Фильтр'><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M10 18h4v-2h-4v2zM3 6v2h18v-2H3zm3 7h12v-2H6v2z\"/></svg></button></th>")
+      .Append("<th>ID Смартплан</th>")
       .Append("</tr></thead><tbody>");
 
     await using (var r = await cmd.ExecuteReaderAsync())
@@ -4711,10 +6257,10 @@ LIMIT 500;", conn);
         while (await r.ReadAsync())
         {
             var id = PlanRowReader.SafeReadInt32(r, 0);
-            var moduleIdVal = r.IsDBNull(3) ? (int?)null : PlanRowReader.SafeReadInt32(r, 3);
             var deptIdVal = r.IsDBNull(4) ? (int?)null : PlanRowReader.SafeReadInt32(r, 4);
-            var moduleName = moduleIdVal is null ? "" : (modules.FirstOrDefault(m => m.id == moduleIdVal.Value).name ?? "");
             var deptName = deptIdVal is null ? "" : (departments.FirstOrDefault(d => d.id == deptIdVal.Value).name ?? "");
+            var moduleNums = ParseModuleNumbers(r.IsDBNull(9) ? null : r.GetString(9));
+            var smartplanCatalog = r.IsDBNull(10) ? "" : r.GetString(10);
             sb.Append("<tr>");
             if (canEditDisc)
                 sb.Append("<td><input type='checkbox' class='row-select row-select-disc' name='selectPlanDisciplineId' value='").Append(id).Append("'><input type='hidden' name='rowId' value='").Append(id).Append("'></td>");
@@ -4724,30 +6270,39 @@ LIMIT 500;", conn);
             {
                 sb.Append("<td><input class='input' name='disciplineNo_").Append(id).Append("' value='").Append(ParseHelpers.H(r.IsDBNull(1) ? "" : r.GetString(1))).Append("' pattern=\"[0-9]*\" title=\"Только цифры\"></td>")
                   .Append("<td><input class='input' name='disciplineName_").Append(id).Append("' value='").Append(ParseHelpers.H(r.IsDBNull(2) ? "" : r.GetString(2))).Append("'></td>")
-                  .Append("<td><select class='input' name='moduleId_").Append(id).Append("'>").Append(OptionsList(modules, moduleIdVal, "Модуль")).Append("</select></td>")
-                  .Append("<td><select class='input' name='departmentId_").Append(id).Append("'>").Append(OptionsList(departments, deptIdVal, "Департамент")).Append("</select></td>")
+                  .Append("<td>").Append(ModuleMultiSelect($"moduleNums_{id}", moduleNums)).Append("</td>")
+                  .Append("<td>")
+                  .Append("<select class='input' name='departmentId_").Append(id).Append("' data-другое-select>")
+                  .Append(OptionsList(departments, deptIdVal, "Департамент"))
+                  .Append("<option value=\"-1\">Другое</option>")
+                  .Append("</select>")
+                  .Append("<input class='input input--другое-custom' name='departmentNameCustom_").Append(id).Append("' value='' placeholder='Департамент' style='display:none'>")
+                  .Append("</td>")
                   .Append("<td><input class='input' name='courseNo_").Append(id).Append("' value='").Append(PlanRowReader.SafeReadIntOrStringAsString(r, 5)).Append("'></td>")
                   .Append("<td><select class='input' name='disciplineKind_").Append(id).Append("'>").Append(OptionsListStrings(SelectOptions.DisciplineKinds, r.IsDBNull(6) ? null : r.GetString(6), "Вид")).Append("</select></td>")
                   .Append("<td><select class='input' name='language_").Append(id).Append("'>").Append(OptionsListStrings(SelectOptions.LanguageOptions, r.IsDBNull(7) ? null : r.GetString(7), "Язык")).Append("</select></td>")
-                  .Append("<td><input class='input' name='credits_").Append(id).Append("' value='").Append(r.IsDBNull(8) ? "" : r.GetDecimal(8).ToString(CultureInfo.InvariantCulture)).Append("'></td>");
+                  .Append("<td><input class='input' name='credits_").Append(id).Append("' value='").Append(r.IsDBNull(8) ? "" : r.GetDecimal(8).ToString(CultureInfo.InvariantCulture)).Append("'></td>")
+                  .Append("<td><input class='input input--readonly' value='").Append(ParseHelpers.H(smartplanCatalog)).Append("' readonly title='Изменяется в согласовании после Смартплан'></td>");
             }
             else
             {
+                var readonlyModules = string.Join(", ", moduleNums.OrderBy(x => x).Select(x => x + " модуль"));
                 sb.Append("<td><input class='input input--readonly' value='").Append(ParseHelpers.H(r.IsDBNull(1) ? "" : r.GetString(1))).Append("' readonly></td>")
                   .Append("<td><input class='input input--readonly' value='").Append(ParseHelpers.H(r.IsDBNull(2) ? "" : r.GetString(2))).Append("' readonly></td>")
-                  .Append("<td><input class='input input--readonly' value='").Append(ParseHelpers.H(moduleName)).Append("' readonly></td>")
+                  .Append("<td>").Append(ParseHelpers.H(readonlyModules)).Append("</td>")
                   .Append("<td><input class='input input--readonly' value='").Append(ParseHelpers.H(deptName)).Append("' readonly></td>")
                   .Append("<td><input class='input input--readonly' value='").Append(PlanRowReader.SafeReadIntOrStringAsString(r, 5)).Append("' readonly></td>")
                   .Append("<td>").Append(ParseHelpers.H(r.IsDBNull(6) ? "" : r.GetString(6))).Append("</td>")
                   .Append("<td>").Append(ParseHelpers.H(r.IsDBNull(7) ? "" : r.GetString(7))).Append("</td>")
-                  .Append("<td><input class='input input--readonly' value='").Append(r.IsDBNull(8) ? "" : r.GetDecimal(8).ToString(CultureInfo.InvariantCulture)).Append("' readonly></td>");
+                  .Append("<td><input class='input input--readonly' value='").Append(r.IsDBNull(8) ? "" : r.GetDecimal(8).ToString(CultureInfo.InvariantCulture)).Append("' readonly></td>")
+                  .Append("<td>").Append(ParseHelpers.H(smartplanCatalog)).Append("</td>");
             }
             sb.Append("</tr>");
         }
     }
 
     sb.Append("</tbody></table></div></div></form></section>");
-    return Results.Content(Layout("Дисциплины", "disciplines", sb.ToString(), user.Login, user.IsAdmin), "text/html; charset=utf-8");
+    return Results.Content(Layout("Дисциплины", "disciplines", sb.ToString(), user.Login, user.IsAdmin, user.CanReviewDisciplineRequests, GetCsrfToken(ctx)), "text/html; charset=utf-8");
 });
 
 app.MapGet("/uidisciplines/export", async (HttpContext ctx, NpgsqlDataSource ds, string? q, string[]? departmentId, string[]? moduleNo) =>
@@ -4762,8 +6317,6 @@ app.MapGet("/uidisciplines/export", async (HttpContext ctx, NpgsqlDataSource ds,
         var allowedDept = new HashSet<int>(user.AllowedDepartmentIds);
         departmentIds = departmentIds.Length == 0 ? user.AllowedDepartmentIds : departmentIds.Where(d => allowedDept.Contains(d)).ToArray();
     }
-    if (!user.IsAdmin && user.AllowedDepartmentIds.Length == 0)
-        departmentIds = new[] { -1 };
     var discExportDepartmentIdsParam = departmentIds.Length == 0 ? (object?)null : departmentIds;
     var discExportModuleNosParam = moduleNos.Length == 0 ? (object?)null : moduleNos;
     await using var conn = await ds.OpenConnectionAsync();
@@ -4777,13 +6330,17 @@ app.MapGet("/uidisciplines/export", async (HttpContext ctx, NpgsqlDataSource ds,
             pd.course_no,
             pd.discipline_kind::text,
             pd.language,
-            pd.credits
+            pd.credits,
+            pd.smartplan_id
         FROM plan_disciplines pd
         LEFT JOIN plan_modules pm ON pd.module_id = pm.module_id
         LEFT JOIN departments d ON pd.implementing_department_id = d.department_id
         WHERE (@q IS NULL OR pd.discipline_name ILIKE @q OR pd.discipline_no ILIKE @q) AND
           (@departmentIds IS NULL OR array_length(@departmentIds, 1) IS NULL OR pd.implementing_department_id = ANY(@departmentIds)) AND
-          (@moduleNos IS NULL OR array_length(@moduleNos, 1) IS NULL OR pm.module_number = ANY(@moduleNos))
+          (@moduleNos IS NULL OR array_length(@moduleNos, 1) IS NULL OR pm.module_number = ANY(@moduleNos)) AND
+          pd.dept_request_status = 'approved'
+          AND pd.smartplan_id IS NOT NULL
+          AND BTRIM(pd.smartplan_id) <> ''
         ORDER BY pd.discipline_name;
 ", conn);
     cmd.Parameters.AddWithValue("q", NpgsqlDbType.Text, (object?)qLike ?? DBNull.Value);
@@ -4791,7 +6348,7 @@ app.MapGet("/uidisciplines/export", async (HttpContext ctx, NpgsqlDataSource ds,
     cmd.Parameters.AddWithValue("moduleNos", NpgsqlDbType.Array | NpgsqlDbType.Integer, (object?)discExportModuleNosParam ?? DBNull.Value);
     using var wb = new XLWorkbook();
     var ws = wb.AddWorksheet("Дисциплины");
-    var headers = new[] { "№ дисц.", "Наименование", "Модуль", "Реализующее подразделение", "Курс", "Вид дисциплины", "Язык", "Зач.ед." };
+    var headers = new[] { "№ дисц.", "Наименование", "Модуль", "Реализующее подразделение", "Курс", "Вид дисциплины", "Язык", "Зач.ед.", "ID Смартплан" };
     for (int i = 0; i < headers.Length; i++) ws.Cell(1, i + 1).Value = headers[i];
     var row = 2;
     await using (var r = await cmd.ExecuteReaderAsync())
@@ -4806,6 +6363,7 @@ app.MapGet("/uidisciplines/export", async (HttpContext ctx, NpgsqlDataSource ds,
             ws.Cell(row, 6).Value = r.IsDBNull(6) ? "" : r.GetString(6);
             ws.Cell(row, 7).Value = r.IsDBNull(7) ? "" : r.GetString(7);
             ws.Cell(row, 8).Value = r.IsDBNull(8) ? "" : r.GetDecimal(8);
+            ws.Cell(row, 9).Value = r.IsDBNull(9) ? "" : r.GetString(9);
             row++;
         }
     }
@@ -4913,10 +6471,22 @@ WHERE plan_id = @planId AND (TRIM(COALESCE(discipline_no,'')) = TRIM(COALESCE(@d
         {
             if (existingId is int eid)
             {
+                await using (var stImp = new NpgsqlCommand("SELECT dept_request_status FROM plan_disciplines WHERE plan_discipline_id = @id", conn, tx))
+                {
+                    stImp.Parameters.AddWithValue("id", NpgsqlDbType.Integer, eid);
+                    var stRow = await stImp.ExecuteScalarAsync();
+                    if (DisciplineWorkflow.IsApprovedStatus(stRow?.ToString()))
+                    {
+                        errors.Add($"Строка «{ParseHelpers.H(disciplineName)}»: согласованную дисциплину нельзя обновить через импорт Excel.");
+                        continue;
+                    }
+                }
                 await using var update = new NpgsqlCommand(@"
 UPDATE plan_disciplines SET discipline_name = @discName, module_id = @moduleId, implementing_department_id = @depId,
   course_no = COALESCE(@courseNo, course_no), discipline_kind = (COALESCE(@discKind, discipline_kind::text))::discipline_kind,
-  language = COALESCE(@language, language), credits = COALESCE(@credits, credits)
+  language = COALESCE(@language, language), credits = COALESCE(@credits, credits),
+  dept_request_status = 'approved',
+  smartplan_id = COALESCE(NULLIF(TRIM(smartplan_id), ''), 'import-excel')
 WHERE plan_discipline_id = @id", conn, tx);
                 update.Parameters.AddWithValue("discName", NpgsqlDbType.Text, disciplineName);
                 update.Parameters.AddWithValue("moduleId", NpgsqlDbType.Integer, (object?)moduleId ?? DBNull.Value);
@@ -4931,8 +6501,8 @@ WHERE plan_discipline_id = @id", conn, tx);
             else
             {
                 await using var insert = new NpgsqlCommand(@"
-INSERT INTO plan_disciplines (plan_id, module_id, discipline_no, discipline_name, implementing_department_id, course_no, discipline_kind, language, credits)
-VALUES (@planId, @moduleId, @discNo, @discName, @depId, @courseNo, @discKind::discipline_kind, @language, @credits);", conn, tx);
+INSERT INTO plan_disciplines (plan_id, module_id, discipline_no, discipline_name, implementing_department_id, course_no, discipline_kind, language, credits, dept_request_status, smartplan_id)
+VALUES (@planId, @moduleId, @discNo, @discName, @depId, @courseNo, @discKind::discipline_kind, @language, @credits, 'approved', 'import-excel');", conn, tx);
                 insert.Parameters.AddWithValue("planId", NpgsqlDbType.Integer, planIdVal!.Value);
                 insert.Parameters.AddWithValue("moduleId", NpgsqlDbType.Integer, (object?)moduleId ?? DBNull.Value);
                 insert.Parameters.AddWithValue("discNo", NpgsqlDbType.Text, (object?)disciplineNo ?? DBNull.Value);
@@ -4965,6 +6535,13 @@ app.MapPost("/uidisciplines/delete", async (HttpContext ctx, NpgsqlDataSource ds
     if (!user.CanEditDisciplines) return Results.Forbid();
     if (planDisciplineId is null) return Results.Redirect("/uidisciplines");
     await using var conn = await ds.OpenConnectionAsync();
+    await using (var chk = new NpgsqlCommand("SELECT dept_request_status FROM plan_disciplines WHERE plan_discipline_id = @id", conn))
+    {
+        chk.Parameters.AddWithValue("id", NpgsqlDbType.Integer, planDisciplineId.Value);
+        var st = await chk.ExecuteScalarAsync();
+        if (DisciplineWorkflow.IsApprovedStatus(st?.ToString()))
+            return Results.Redirect("/uidisciplines?err=approved_delete");
+    }
     await using var tx = await conn.BeginTransactionAsync();
     await using (var cmd = new NpgsqlCommand(@"
 DELETE FROM assignment_hours
@@ -4984,7 +6561,7 @@ WHERE assignment_id IN (SELECT assignment_id FROM teaching_assignments WHERE pla
         await cmd3.ExecuteNonQueryAsync();
     }
     await tx.CommitAsync();
-    return Results.Redirect("/uidisciplines");
+    return Results.Redirect("/uidisciplines?deleted=1");
 });
 
 app.MapPost("/uidisciplines/delete-batch", async (HttpContext ctx, NpgsqlDataSource ds, int[]? planDisciplineIds) =>
@@ -4997,6 +6574,13 @@ app.MapPost("/uidisciplines/delete-batch", async (HttpContext ctx, NpgsqlDataSou
     await using var tx = await conn.BeginTransactionAsync();
     foreach (var id in planDisciplineIds)
     {
+        await using (var chk = new NpgsqlCommand("SELECT dept_request_status FROM plan_disciplines WHERE plan_discipline_id = @id", conn, tx))
+        {
+            chk.Parameters.AddWithValue("id", NpgsqlDbType.Integer, id);
+            var st = await chk.ExecuteScalarAsync();
+            if (DisciplineWorkflow.IsApprovedStatus(st?.ToString()))
+                continue;
+        }
         await using (var cmd = new NpgsqlCommand(@"
 DELETE FROM assignment_hours
 WHERE assignment_id IN (SELECT assignment_id FROM teaching_assignments WHERE plan_discipline_id = @id);", conn, tx))
@@ -5016,7 +6600,44 @@ WHERE assignment_id IN (SELECT assignment_id FROM teaching_assignments WHERE pla
         }
     }
     await tx.CommitAsync();
-    return Results.Redirect("/uidisciplines");
+    return Results.Redirect("/uidisciplines?deleted=1");
+});
+
+app.MapPost("/uiplan/delete-batch", async (HttpContext ctx, NpgsqlDataSource ds, int[]? planDisciplineIds) =>
+{
+    var user = await GetCurrentUser(ds, ctx.User);
+    if (user is null) return Results.Redirect("/login");
+    if (!user.CanEditPlan) return Results.Redirect("/uiplan");
+    if (planDisciplineIds is null || planDisciplineIds.Length == 0) return Results.Redirect("/uiplan");
+    await using var conn = await ds.OpenConnectionAsync();
+    await using var tx = await conn.BeginTransactionAsync();
+    foreach (var id in planDisciplineIds)
+    {
+        await using var chk = new NpgsqlCommand("SELECT dept_request_status FROM plan_disciplines WHERE plan_discipline_id = @id", conn, tx);
+        chk.Parameters.AddWithValue("id", NpgsqlDbType.Integer, id);
+        var st = await chk.ExecuteScalarAsync();
+        if (!DisciplineWorkflow.OpMayDeleteRow(st?.ToString()))
+            continue;
+        await using (var cmd = new NpgsqlCommand(@"
+DELETE FROM assignment_hours
+WHERE assignment_id IN (SELECT assignment_id FROM teaching_assignments WHERE plan_discipline_id = @id);", conn, tx))
+        {
+            cmd.Parameters.AddWithValue("id", NpgsqlDbType.Integer, id);
+            await cmd.ExecuteNonQueryAsync();
+        }
+        await using (var cmd2 = new NpgsqlCommand("DELETE FROM teaching_assignments WHERE plan_discipline_id = @id", conn, tx))
+        {
+            cmd2.Parameters.AddWithValue("id", NpgsqlDbType.Integer, id);
+            await cmd2.ExecuteNonQueryAsync();
+        }
+        await using (var cmd3 = new NpgsqlCommand("DELETE FROM plan_disciplines WHERE plan_discipline_id = @id", conn, tx))
+        {
+            cmd3.Parameters.AddWithValue("id", NpgsqlDbType.Integer, id);
+            await cmd3.ExecuteNonQueryAsync();
+        }
+    }
+    await tx.CommitAsync();
+    return Results.Redirect("/uiplan?deleted=1");
 });
 
 app.MapPost("/uidisciplines/save-batch-form", async (HttpContext ctx, NpgsqlDataSource ds, HttpRequest request) =>
@@ -5046,8 +6667,33 @@ app.MapPost("/uidisciplines/save-batch-form", async (HttpContext ctx, NpgsqlData
 
         var disciplineNo = Get("disciplineNo");
         var disciplineName = Get("disciplineName");
-        var moduleId = ParseHelpers.IntOrNull(Get("moduleId"));
-        var departmentId = ParseHelpers.IntOrNull(Get("departmentId"));
+        var selectedModules = form[$"moduleNums_{rowKey}"];
+        var moduleNumbersStr = selectedModules.Count > 0
+            ? string.Join(",", selectedModules.Where(s => int.TryParse(s, out var n) && n >= 1 && n <= 4).OrderBy(s => s))
+            : null;
+        var departmentIdRaw = Get("departmentId");
+        var departmentId = ParseHelpers.IntOrNull(departmentIdRaw);
+        if (departmentId == -1)
+        {
+            departmentId = null;
+            var deptCustomName = Get("departmentNameCustom");
+            if (!string.IsNullOrWhiteSpace(deptCustomName))
+            {
+                await using var deptSel2 = new NpgsqlCommand("SELECT department_id FROM departments WHERE name = @name LIMIT 1", conn, tx);
+                deptSel2.Parameters.AddWithValue("name", NpgsqlDbType.Text, deptCustomName.Trim());
+                var deptFound = await deptSel2.ExecuteScalarAsync();
+                if (deptFound is int existingDeptId)
+                {
+                    departmentId = existingDeptId;
+                }
+                else
+                {
+                    await using var deptIns2 = new NpgsqlCommand("INSERT INTO departments (name) VALUES (@name) RETURNING department_id", conn, tx);
+                    deptIns2.Parameters.AddWithValue("name", NpgsqlDbType.Text, deptCustomName.Trim());
+                    departmentId = await deptIns2.ExecuteScalarAsync() as int?;
+                }
+            }
+        }
         var courseNo = ParseHelpers.IntOrNull(Get("courseNo"));
         var disciplineKind = Get("disciplineKind");
         var language = Get("language");
@@ -5074,6 +6720,20 @@ app.MapPost("/uidisciplines/save-batch-form", async (HttpContext ctx, NpgsqlData
             continue;
         }
 
+        if (id is int existingDiscId)
+        {
+            await using (var stCmd = new NpgsqlCommand("SELECT dept_request_status FROM plan_disciplines WHERE plan_discipline_id = @id", conn, tx))
+            {
+                stCmd.Parameters.AddWithValue("id", NpgsqlDbType.Integer, existingDiscId);
+                var stObj = await stCmd.ExecuteScalarAsync();
+                if (DisciplineWorkflow.IsApprovedStatus(stObj?.ToString()))
+                {
+                    errors.Add($"Согласованные дисциплины нельзя менять во вкладке «Дисциплины» (строка {rowKey}). Возврат на доработку — через департамент.");
+                    continue;
+                }
+            }
+        }
+
         if (id is null)
         {
             if (planIdDefault is null)
@@ -5083,15 +6743,16 @@ app.MapPost("/uidisciplines/save-batch-form", async (HttpContext ctx, NpgsqlData
             }
             await using var insert = new NpgsqlCommand(@"
 INSERT INTO plan_disciplines (
-    plan_id, module_id, discipline_no, discipline_name, implementing_department_id,
-    course_no, discipline_kind, language, credits
+    plan_id, discipline_no, discipline_name, implementing_department_id,
+    course_no, discipline_kind, language, credits, module_numbers,
+    dept_request_status, smartplan_id
 )
 VALUES (
-    @planId, @moduleId, @discNo, @discName, @depId,
-    @courseNo, @discKind, @language, @credits
+    @planId, @discNo, @discName, @depId,
+    @courseNo, @discKind, @language, @credits, @moduleNumbers,
+    'approved', 'catalog-tab'
 );", conn, tx);
             insert.Parameters.AddWithValue("planId", NpgsqlDbType.Integer, planIdDefault.Value);
-            insert.Parameters.AddWithValue("moduleId", NpgsqlDbType.Integer, (object?)moduleId ?? DBNull.Value);
             insert.Parameters.AddWithValue("discNo", NpgsqlDbType.Text, (object?)disciplineNo ?? DBNull.Value);
             insert.Parameters.AddWithValue("discName", NpgsqlDbType.Text, disciplineName);
             insert.Parameters.AddWithValue("depId", NpgsqlDbType.Integer, (object?)departmentId ?? DBNull.Value);
@@ -5099,6 +6760,7 @@ VALUES (
             insert.Parameters.AddWithValue("discKind", NpgsqlDbType.Text, (object?)disciplineKind ?? DBNull.Value);
             insert.Parameters.AddWithValue("language", NpgsqlDbType.Text, (object?)language ?? DBNull.Value);
             insert.Parameters.AddWithValue("credits", NpgsqlDbType.Numeric, (object?)credits ?? DBNull.Value);
+            insert.Parameters.AddWithValue("moduleNumbers", NpgsqlDbType.Text, (object?)moduleNumbersStr ?? DBNull.Value);
             await insert.ExecuteNonQueryAsync();
         }
         else
@@ -5107,21 +6769,21 @@ VALUES (
 UPDATE plan_disciplines
 SET discipline_no = COALESCE(@discNo, discipline_no),
     discipline_name = COALESCE(@discName, discipline_name),
-    module_id = COALESCE(@moduleId, module_id),
     implementing_department_id = COALESCE(@depId, implementing_department_id),
     course_no = COALESCE(@courseNo, course_no),
     discipline_kind = (COALESCE(@discKind, discipline_kind::text))::discipline_kind,
     language = COALESCE(@language, language),
-    credits = COALESCE(@credits, credits)
+    credits = COALESCE(@credits, credits),
+    module_numbers = @moduleNumbers
 WHERE plan_discipline_id = @id;", conn, tx);
             update.Parameters.AddWithValue("discNo", NpgsqlDbType.Text, (object?)disciplineNo ?? DBNull.Value);
             update.Parameters.AddWithValue("discName", NpgsqlDbType.Text, (object?)disciplineName ?? DBNull.Value);
-            update.Parameters.AddWithValue("moduleId", NpgsqlDbType.Integer, (object?)moduleId ?? DBNull.Value);
             update.Parameters.AddWithValue("depId", NpgsqlDbType.Integer, (object?)departmentId ?? DBNull.Value);
             update.Parameters.AddWithValue("courseNo", NpgsqlDbType.Integer, (object?)courseNo ?? DBNull.Value);
             update.Parameters.AddWithValue("discKind", NpgsqlDbType.Text, (object?)disciplineKind ?? DBNull.Value);
             update.Parameters.AddWithValue("language", NpgsqlDbType.Text, (object?)language ?? DBNull.Value);
             update.Parameters.AddWithValue("credits", NpgsqlDbType.Numeric, (object?)credits ?? DBNull.Value);
+            update.Parameters.AddWithValue("moduleNumbers", NpgsqlDbType.Text, (object?)moduleNumbersStr ?? DBNull.Value);
             update.Parameters.AddWithValue("id", NpgsqlDbType.Integer, id.Value);
             await update.ExecuteNonQueryAsync();
         }
@@ -5134,7 +6796,7 @@ WHERE plan_discipline_id = @id;", conn, tx);
     }
 
     await tx.CommitAsync();
-    return Results.Redirect("/uidisciplines");
+    return Results.Redirect("/uidisciplines?saved=1");
 }).DisableAntiforgery();
 
 app.MapPost("/uifaculty/save-batch", async (HttpContext ctx, NpgsqlDataSource ds, HttpRequest request) =>
@@ -5165,6 +6827,7 @@ app.MapPost("/uifaculty/save-batch", async (HttpContext ctx, NpgsqlDataSource ds
 
     await using var conn = await ds.OpenConnectionAsync();
     await using var tx = await conn.BeginTransactionAsync();
+    var jsonFacultySeen = new HashSet<(string norm, int deptKey)>();
 
     foreach (var row in rows)
     {
@@ -5185,6 +6848,26 @@ app.MapPost("/uifaculty/save-batch", async (HttpContext ctx, NpgsqlDataSource ds
         var isActiveValue = ParseHelpers.BoolOrNull(Get("isActive"));
 
         if (string.IsNullOrWhiteSpace(ppsName)) continue;
+        var nameT = ppsName.Trim();
+        int? effDept = departmentId;
+        if (ppsNo is not null)
+        {
+            await using var curD = new NpgsqlCommand("SELECT department_id FROM faculty_members WHERE faculty_id = @id", conn, tx);
+            curD.Parameters.AddWithValue("id", NpgsqlDbType.Integer, ppsNo.Value);
+            var d = await curD.ExecuteScalarAsync();
+            if (effDept is null && d is int od) effDept = od;
+        }
+        var dk = effDept.HasValue ? effDept.Value : -1;
+        if (!jsonFacultySeen.Add((nameT.ToLowerInvariant(), dk)))
+        {
+            await tx.RollbackAsync();
+            return Results.BadRequest("В пакете повторяется пара ФИО и департамент.");
+        }
+        if (await FacultyNameDepartmentTaken(conn, tx, nameT, effDept, ppsNo))
+        {
+            await tx.RollbackAsync();
+            return Results.BadRequest($"Преподаватель «{nameT}» уже есть в этом департаменте.");
+        }
 
         if (ppsNo is null)
         {
@@ -5198,7 +6881,7 @@ VALUES (
     @track, @auditoryLoad, @normHours, @performedLoad, @responsibleLoad
 );
 ", conn, tx);
-            insert.Parameters.AddWithValue("fullName", NpgsqlDbType.Text, ppsName);
+            insert.Parameters.AddWithValue("fullName", NpgsqlDbType.Text, nameT);
             insert.Parameters.AddWithValue("position", NpgsqlDbType.Text, (object?)position ?? DBNull.Value);
             insert.Parameters.AddWithValue("rate", NpgsqlDbType.Numeric, (object?)rate ?? DBNull.Value);
             insert.Parameters.AddWithValue("nrd", NpgsqlDbType.Numeric, (object?)nrdShare ?? DBNull.Value);
@@ -5256,7 +6939,7 @@ app.MapGet("/admin/users", async (HttpContext ctx, NpgsqlDataSource ds) =>
 {
     var user = await GetCurrentUser(ds, ctx.User);
     if (user is null) return Results.Redirect("/login");
-    if (!user.IsAdmin) return Results.Redirect("/uiworkload");
+    if (!user.IsAdmin) return Results.Forbid();
     await EnsureAuthTables(ds);
     var list = new List<(int id, string login, string displayName, string role)>();
     await using var conn = await ds.OpenConnectionAsync();
@@ -5270,14 +6953,14 @@ app.MapGet("/admin/users", async (HttpContext ctx, NpgsqlDataSource ds) =>
     foreach (var u in list)
         sb.Append("<tr><td>").Append(ParseHelpers.H(u.login)).Append("</td><td>").Append(ParseHelpers.H(u.displayName)).Append("</td><td>").Append(ParseHelpers.H(u.role)).Append("</td><td><a class='link' href='/admin/users/edit?userId=").Append(u.id).Append("'>Изменить</a></td></tr>");
     sb.Append("</tbody></table></section>");
-    return Results.Content(Layout("Пользователи", "admin", sb.ToString(), user.Login, user.IsAdmin), "text/html; charset=utf-8");
+    return Results.Content(Layout("Пользователи", "admin", sb.ToString(), user.Login, user.IsAdmin, user.CanReviewDisciplineRequests, GetCsrfToken(ctx)), "text/html; charset=utf-8");
 });
 
 app.MapGet("/admin/users/new", async (HttpContext ctx, NpgsqlDataSource ds) =>
 {
     var user = await GetCurrentUser(ds, ctx.User);
     if (user is null) return Results.Redirect("/login");
-    if (!user.IsAdmin) return Results.Redirect("/uiworkload");
+    if (!user.IsAdmin) return Results.Forbid();
     var departments = await LoadDepartments(ds);
     var allOps = OpMagistracy.Concat(OpBachelor).Distinct().ToArray();
     var sb = new StringBuilder();
@@ -5315,14 +6998,14 @@ form.form.form--stacked.form--admin{max-width:none!important;width:100%!importan
     sb.Append("</select><span class='form__hint'>Удерживайте Ctrl для выбора нескольких</span></div></div>");
     sb.Append("</div>");
     sb.Append("<div class='form__actions'><button class='btn' type='submit'>Создать</button><a class='btn btn--ghost' href='/admin/users'>Отмена</a></div></form></section>");
-    return Results.Content(Layout("Новый пользователь", "admin", sb.ToString(), user.Login, user.IsAdmin), "text/html; charset=utf-8");
+    return Results.Content(Layout("Новый пользователь", "admin", sb.ToString(), user.Login, user.IsAdmin, user.CanReviewDisciplineRequests, GetCsrfToken(ctx)), "text/html; charset=utf-8");
 });
 
 app.MapPost("/admin/users/create", async (HttpContext ctx, NpgsqlDataSource ds, IFormCollection form) =>
 {
     var user = await GetCurrentUser(ds, ctx.User);
     if (user is null) return Results.Redirect("/login");
-    if (!user.IsAdmin) return Results.Redirect("/uiworkload");
+    if (!user.IsAdmin) return Results.Forbid();
     var login = form["login"].ToString()?.Trim();
     var password = form["password"].ToString();
     var displayName = form["displayName"].ToString()?.Trim();
@@ -5358,7 +7041,7 @@ app.MapGet("/admin/users/edit", async (HttpContext ctx, NpgsqlDataSource ds, int
 {
     var user = await GetCurrentUser(ds, ctx.User);
     if (user is null) return Results.Redirect("/login");
-    if (!user.IsAdmin) return Results.Redirect("/uiworkload");
+    if (!user.IsAdmin) return Results.Forbid();
     if (userId is null) return Results.Redirect("/admin/users");
     await using var conn = await ds.OpenConnectionAsync();
     await using var cmd = new NpgsqlCommand("SELECT login, COALESCE(display_name,''), role FROM app_users WHERE user_id = @id", conn);
@@ -5422,15 +7105,15 @@ form.form.form--stacked.form--admin{max-width:none!important;width:100%!importan
         sb.Append("<option value='").Append(d.id).Append("'").Append(deptSet.Contains(d.id) ? " selected" : "").Append(">").Append(ParseHelpers.H(d.name)).Append("</option>");
     sb.Append("</select><span class='form__hint'>Удерживайте Ctrl для выбора нескольких</span></div></div>");
     sb.Append("</div>");
-    sb.Append("<div class='form__actions'><button class='btn' type='submit'>Сохранить</button><a class='btn btn--ghost' href='/admin/users'>Отмена</a></div></form></section>");
-    return Results.Content(Layout("Редактировать пользователя", "admin", sb.ToString(), user.Login, user.IsAdmin), "text/html; charset=utf-8");
+    sb.Append($"<div class='form__actions'><button class='btn' type='submit'>{IconSave} Сохранить</button><a class='btn btn--ghost' href='/admin/users'>Отмена</a></div></form></section>");
+    return Results.Content(Layout("Редактировать пользователя", "admin", sb.ToString(), user.Login, user.IsAdmin, user.CanReviewDisciplineRequests, GetCsrfToken(ctx)), "text/html; charset=utf-8");
 });
 
 app.MapPost("/admin/users/save", async (HttpContext ctx, NpgsqlDataSource ds, IFormCollection form) =>
 {
     var user = await GetCurrentUser(ds, ctx.User);
     if (user is null) return Results.Redirect("/login");
-    if (!user.IsAdmin) return Results.Redirect("/uiworkload");
+    if (!user.IsAdmin) return Results.Forbid();
     var userId = ParseHelpers.IntOrNull(form["userId"].ToString());
     if (userId is null) return Results.Redirect("/admin/users");
     var displayName = form["displayName"].ToString()?.Trim();
@@ -5475,8 +7158,11 @@ app.MapPost("/admin/users/save", async (HttpContext ctx, NpgsqlDataSource ds, IF
     return Results.Redirect("/admin/users");
 }).DisableAntiforgery();
 
-app.MapGet("/uidb", async (NpgsqlDataSource ds) =>
+app.MapGet("/uidb", async (HttpContext ctx, NpgsqlDataSource ds) =>
 {
+    var user = await GetCurrentUser(ds, ctx.User);
+    if (user is null) return Results.Redirect("/login");
+    if (!user.IsAdmin) return Results.Redirect("/");
     await using var conn = await ds.OpenConnectionAsync();
     await using var cmd = new NpgsqlCommand(@"
 SELECT table_name
@@ -5499,11 +7185,14 @@ ORDER BY table_name;
     }
 
     sb.Append("</ul></section>");
-    return Results.Content(Layout("DB", "db", sb.ToString()), "text/html; charset=utf-8");
+    return Results.Content(Layout("DB", "db", sb.ToString(), user.Login, user.IsAdmin, false, GetCsrfToken(ctx)), "text/html; charset=utf-8");
 });
 
-app.MapGet("/uidbtable", async (NpgsqlDataSource ds, string table, int limit = 50, int offset = 0) =>
+app.MapGet("/uidbtable", async (HttpContext ctx, NpgsqlDataSource ds, string table, int limit = 50, int offset = 0) =>
 {
+    var user = await GetCurrentUser(ds, ctx.User);
+    if (user is null) return Results.Redirect("/login");
+    if (!user.IsAdmin) return Results.Redirect("/");
     bool IsSafeIdentifier(string name) => Regex.IsMatch(name, @"^[A-Za-z_][A-Za-z0-9_]*$");
     string QuoteIdent(string ident) => $"\"{ident.Replace("\"", "\"\"")}\"";
 
@@ -5545,20 +7234,22 @@ app.MapGet("/uidbtable", async (NpgsqlDataSource ds, string table, int limit = 5
 
     sb.Append("</tbody></table></div></section>");
 
-    return Results.Content(Layout("DB", "db", sb.ToString()), "text/html; charset=utf-8");
+    return Results.Content(Layout("DB", "db", sb.ToString(), user.Login, user.IsAdmin, false, GetCsrfToken(ctx)), "text/html; charset=utf-8");
 });
 
 // При старте: обновить представление нагрузки (идемпотентно)
 using (var scope = app.Services.CreateScope())
 {
     var ds = scope.ServiceProvider.GetRequiredService<NpgsqlDataSource>();
-    EnsureWorkloadView(ds).GetAwaiter().GetResult();
     EnsureEmploymentTypeColumn(ds).GetAwaiter().GetResult();
+    EnsureNormalizationFixes(ds).GetAwaiter().GetResult();
+    EnsureWorkloadView(ds).GetAwaiter().GetResult();
+    OpBudgetHelper.LoadFromDb(ds);
 }
 
 app.Run();
 
-// Платные (коммерческие) ОП; остальные — бюджетные
+// Fallback-список коммерческих ОП (используется для миграции is_commercial в educational_programs)
 static class OpBudgetHelper
 {
     public static readonly HashSet<string> CommercialOpNames = new(StringComparer.OrdinalIgnoreCase)
@@ -5573,8 +7264,28 @@ static class OpBudgetHelper
         "Управление B2C-бизнесом: технологии и инновации",
         "Управление продуктом в ИТ-бизнесе"
     };
+    private static HashSet<string>? _dbCommercialNames;
+    public static void LoadFromDb(NpgsqlDataSource ds)
+    {
+        try
+        {
+            using var conn = ds.OpenConnection();
+            using var cmd = new NpgsqlCommand("SELECT name FROM educational_programs WHERE is_commercial = true", conn);
+            using var r = cmd.ExecuteReader();
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            while (r.Read()) names.Add(r.GetString(0));
+            if (names.Count > 0) _dbCommercialNames = names;
+        }
+        catch { }
+    }
+    public static bool IsCommercial(string? opName)
+    {
+        if (string.IsNullOrWhiteSpace(opName)) return false;
+        var set = _dbCommercialNames ?? CommercialOpNames;
+        return set.Contains(opName.Trim());
+    }
     public static string OpBudgetCommercial(string? opName) =>
-        !string.IsNullOrWhiteSpace(opName) && CommercialOpNames.Contains(opName.Trim()) ? "Коммерческая" : "Бюджетная";
+        IsCommercial(opName) ? "Коммерческая" : "Бюджетная";
 }
 
 static class SelectOptions
@@ -5616,6 +7327,20 @@ record UserInfo(int UserId, string Login, string DisplayName, string Role, strin
     public bool CanEditWorkload => IsAdmin || IsDepartmentManager;
     public bool CanEditFaculty => IsAdmin || IsDepartmentManager;
     public bool CanEditDisciplines => IsAdmin || IsAcademicDirector;
+    /// <summary>Очередь согласования дисциплин (менеджер департамента / админ).</summary>
+    public bool CanReviewDisciplineRequests => IsAdmin || IsDepartmentManager;
+}
+
+static class DisciplineApprovalPermissions
+{
+    public static bool UserMayAccessDept(UserInfo user, int implementingDepartmentId) =>
+        user.IsAdmin || (user.AllowedDepartmentIds.Length > 0 && user.AllowedDepartmentIds.Contains(implementingDepartmentId));
+
+    /// <summary>Вернуть уже согласованную дисциплину на доработку может только менеджер соответствующего департамента (не админ).</summary>
+    public static bool UserMayReworkApproved(UserInfo user, int implementingDepartmentId) =>
+        user.IsDepartmentManager
+        && user.AllowedDepartmentIds.Length > 0
+        && user.AllowedDepartmentIds.Contains(implementingDepartmentId);
 }
 
 /// <summary>Парсинг Excel: первая строка — заголовки (можно свои), далее данные. Колонки сопоставляются по смыслу.</summary>

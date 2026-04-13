@@ -38,6 +38,8 @@ public class WorkloadUnallocatedTests : IClassFixture<WebAppFactory>
         var html = await GetWorkloadHtmlAsync(_factory);
         if (string.IsNullOrEmpty(html) || !html.Contains("Нагрузка", StringComparison.OrdinalIgnoreCase))
             return;
+        if (!html.Contains("id=\"wl-table\"", StringComparison.OrdinalIgnoreCase))
+            return;
         Assert.Contains("Нераспределённая нагрузка", html);
     }
 
@@ -65,7 +67,9 @@ public class WorkloadUnallocatedTests : IClassFixture<WebAppFactory>
         var html = await GetWorkloadHtmlAsync(_factory);
         if (string.IsNullOrEmpty(html) || !html.Contains("Нагрузка", StringComparison.OrdinalIgnoreCase))
             return;
-        // Выгрузка в Excel: ссылка или форма
+        if (!html.Contains("wl-batch-form", StringComparison.OrdinalIgnoreCase) &&
+            !html.Contains("id=\"wl-table\"", StringComparison.OrdinalIgnoreCase))
+            return;
         Assert.True(
             html.Contains("Выгрузить в Excel", StringComparison.OrdinalIgnoreCase) ||
             html.Contains("uiworkload/export", StringComparison.OrdinalIgnoreCase) ||

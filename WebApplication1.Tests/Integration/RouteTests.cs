@@ -140,4 +140,34 @@ public class RouteTests : IClassFixture<WebAppFactory>
         if (response.StatusCode == HttpStatusCode.Redirect)
             Assert.Contains("/login", response.Headers.Location?.OriginalString ?? "", StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public async Task ChangePassword_WhenNotAuthenticated_RedirectsToLogin()
+    {
+        var response = await _client.GetAsync("/change-password");
+        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        Assert.StartsWith("/login", response.Headers.Location?.OriginalString ?? "");
+    }
+
+    [Fact]
+    public async Task UidbTable_WhenNotAuthenticated_RedirectsToLogin()
+    {
+        var response = await _client.GetAsync("/uidbtable?table=app_users");
+        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        Assert.StartsWith("/login", response.Headers.Location?.OriginalString ?? "");
+    }
+
+    [Fact]
+    public async Task SeedOps_Post_WhenNotAuthenticated_RedirectsToLogin()
+    {
+        var response = await _client.PostAsync("/uiworkload/seed-ops", new FormUrlEncodedContent(Array.Empty<KeyValuePair<string, string>>()));
+        // Неаутентифицированный → редирект на /login или 401/403
+        Assert.True(
+            response.StatusCode == HttpStatusCode.Redirect ||
+            response.StatusCode == HttpStatusCode.Unauthorized ||
+            response.StatusCode == HttpStatusCode.Forbidden,
+            $"Expected redirect or 401/403, got {response.StatusCode}");
+        if (response.StatusCode == HttpStatusCode.Redirect)
+            Assert.StartsWith("/login", response.Headers.Location?.OriginalString ?? "");
+    }
 }

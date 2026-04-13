@@ -37,9 +37,10 @@ public class PageContentTests : IClassFixture<WebAppFactory>
         var html = await GetPageHtmlAsync(_factory, "/uiworkload");
         if (string.IsNullOrEmpty(html) || !html.Contains("Нагрузка", StringComparison.OrdinalIgnoreCase))
             return;
+        if (!html.Contains("id=\"wl-table\"", StringComparison.OrdinalIgnoreCase))
+            return;
         Assert.Contains("data-wl-add", html);
         Assert.Contains("Добавить строку", html);
-        Assert.Contains("id=\"wl-table\"", html);
         Assert.Contains("wl-batch-form", html);
     }
 

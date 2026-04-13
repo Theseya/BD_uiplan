@@ -80,4 +80,21 @@ public class ParseHelpersTests
         Assert.Equal("&quot;", ParseHelpers.H("\""));
         Assert.Equal("", ParseHelpers.H(null));
     }
+
+    [Theory]
+    [InlineData(null, true)]
+    [InlineData("", true)]
+    [InlineData("  ", true)]
+    [InlineData("123", true)]
+    [InlineData("0", true)]
+    [InlineData("999999", true)]
+    [InlineData("12a", false)]
+    [InlineData("abc", false)]
+    [InlineData("1.5", false)]
+    [InlineData("12 34", false)]
+    [InlineData("-1", false)]
+    public void IsValidDisciplineNo_ValidatesCorrectly(string? input, bool expected)
+    {
+        Assert.Equal(expected, ParseHelpers.IsValidDisciplineNo(input));
+    }
 }

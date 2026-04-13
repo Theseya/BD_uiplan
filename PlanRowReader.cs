@@ -17,10 +17,12 @@ public static class PlanRowReader
         return int.TryParse(value.ToString(), out var p) ? p : null;
     }
 
-    /// <summary>Read plan_id from column 36 only when reader has more than 36 columns (main query); otherwise return 0.</summary>
+    /// <summary>Read plan_id: index 36 in legacy 37-column sets; index 37 when academic_year is present at 36 (38+ columns).</summary>
     public static int SafeReadPlanId(DbDataReader r)
     {
-        return r.FieldCount > 36 ? SafeReadInt32(r, 36) : 0;
+        if (r.FieldCount <= 36) return 0;
+        if (r.FieldCount >= 38) return SafeReadInt32(r, 37);
+        return SafeReadInt32(r, 36);
     }
 
     /// <summary>Read a column that may be int or text/numeric (e.g. course_no, streams_count) as display string.</summary>

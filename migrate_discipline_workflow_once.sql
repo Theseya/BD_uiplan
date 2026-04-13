@@ -1,0 +1,5 @@
+-- Ручная миграция (если колонки уже были добавлены с DEFAULT draft и все строки оказались черновиками):
+-- UPDATE plan_disciplines
+-- SET dept_request_status = 'approved',
+--     smartplan_id = COALESCE(NULLIF(TRIM(smartplan_id), ''), 'legacy-' || plan_discipline_id::text)
+-- WHERE plan_discipline_id IN (... список старых id ...);

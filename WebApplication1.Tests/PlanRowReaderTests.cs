@@ -90,6 +90,19 @@ public class PlanRowReaderTests
     }
 
     [Fact]
+    public void SafeReadPlanId_WhenReaderHas38Columns_ReadsPlanIdFromColumn37()
+    {
+        var table = new DataTable();
+        for (int i = 0; i < 38; i++)
+            table.Columns.Add("c" + i, typeof(int));
+        table.Rows.Add(Enumerable.Range(0, 37).Select(i => (object)i).Concat(new object[] { 99 }).ToArray());
+        using var reader = table.CreateDataReader();
+        reader.Read();
+        var planId = PlanRowReader.SafeReadPlanId(reader);
+        Assert.Equal(99, planId);
+    }
+
+    [Fact]
     public void SafeReadIntOrStringAsString_IntColumn_ReturnsString()
     {
         var table = new DataTable();

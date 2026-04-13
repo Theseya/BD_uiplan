@@ -10,7 +10,7 @@
 -- ==================== Справочники ====================
 CREATE TABLE IF NOT EXISTS departments (
   department_id SERIAL PRIMARY KEY,
-  name VARCHAR(500) NOT NULL
+  name VARCHAR(500) NOT NULL UNIQUE
 );
 
 CREATE TABLE IF NOT EXISTS educational_programs (
@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS educational_programs (
   name VARCHAR(500) NOT NULL,
   education_level VARCHAR(100),
   study_format VARCHAR(100),
-  is_active BOOLEAN NOT NULL DEFAULT true
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  is_commercial BOOLEAN NOT NULL DEFAULT false
 );
 
 CREATE TABLE IF NOT EXISTS faculty_members (
@@ -37,6 +38,10 @@ CREATE TABLE IF NOT EXISTS faculty_members (
   responsible_load NUMERIC
 );
 
+-- Одно и то же ФИО в разных департаментах — разные строки; дубли (то же ФИО + тот же департамент) запрещены.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_faculty_members_full_name_department
+  ON faculty_members (LOWER(TRIM(full_name)), COALESCE(department_id, -1));
+
 CREATE TABLE IF NOT EXISTS work_types (
   work_type_id SERIAL PRIMARY KEY,
   name VARCHAR(200) NOT NULL
@@ -54,7 +59,8 @@ CREATE TABLE IF NOT EXISTS plan_modules (
   module_id SERIAL PRIMARY KEY,
   plan_id INT NOT NULL REFERENCES study_plans(plan_id) ON DELETE CASCADE,
   module_name VARCHAR(500),
-  module_number INT
+  module_number INT,
+  UNIQUE (plan_id, module_number)
 );
 
 CREATE TABLE IF NOT EXISTS plan_programs (
@@ -96,7 +102,10 @@ CREATE TABLE IF NOT EXISTS plan_disciplines (
   aud_seminar_hours NUMERIC,
   aud_nis_ps_sn_hours NUMERIC,
   aud_total_hours NUMERIC,
-  total_hours NUMERIC
+  total_hours NUMERIC,
+  dept_request_status VARCHAR(30) NOT NULL DEFAULT 'draft',
+  dept_message_to_op TEXT,
+  smartplan_id VARCHAR(200)
 );
 
 CREATE TABLE IF NOT EXISTS plan_discipline_programs (
@@ -137,9 +146,12 @@ SELECT
   ep.op_id,
   ep.education_level,
   d.name AS department_name,
+  pd.streams_count,
+  pd.groups_count,
   wt.name AS work_type,
   ah.hours,
-  fm.full_name AS faculty_name
+  fm.full_name AS faculty_name,
+  pd.course_no
 FROM teaching_assignments ta
 JOIN assignment_hours ah ON ah.assignment_id = ta.assignment_id
 JOIN plan_disciplines pd ON ta.plan_discipline_id = pd.plan_discipline_id
