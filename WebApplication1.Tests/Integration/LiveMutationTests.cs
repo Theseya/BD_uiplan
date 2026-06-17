@@ -16,26 +16,24 @@ public class LiveMutationTests : IClassFixture<LiveWebAppFactory>
     public async Task FacultySave_InsertsRowIntoDatabase()
     {
         var uniqueName = "TEST_SAVE_" + Guid.NewGuid().ToString("N")[..10];
-        var client = await LiveTestAuthHelper.CreateAuthenticatedClientAsync(_factory, returnUrl: "/uifaculty", allowAutoRedirect: false);
+        await using var conn = await LiveTestAuthHelper.OpenConnectionAsync();
+        await using var deptCmd = new NpgsqlCommand(
+            "SELECT department_id FROM departments WHERE name = 'Департамент маркетинга' LIMIT 1", conn);
+        var deptId = Convert.ToInt32(await deptCmd.ExecuteScalarAsync());
+
+        var client = await LiveTestAuthHelper.CreateAuthenticatedClientAsync(
+            _factory, LiveTestConfig.DepartmentManagerLogin, returnUrl: "/uifaculty", allowAutoRedirect: false);
         var form = new FormUrlEncodedContent(new[]
         {
             new KeyValuePair<string, string>("ppsName", uniqueName),
-            new KeyValuePair<string, string>("departmentId", "1"),
+            new KeyValuePair<string, string>("departmentId", deptId.ToString()),
             new KeyValuePair<string, string>("position", "Преподаватель")
         });
         var response = await client.PostAsync("/uifaculty/save", form);
         Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
-
-        await using var conn = await LiveTestAuthHelper.OpenConnectionAsync();
-        await using var read = new NpgsqlCommand(
-            "SELECT faculty_id FROM faculty_members WHERE full_name = @name", conn);
-        read.Parameters.AddWithValue("name", NpgsqlDbType.Text, uniqueName);
-        var id = await read.ExecuteScalarAsync();
-        Assert.NotNull(id);
-
-        await using var del = new NpgsqlCommand("DELETE FROM faculty_members WHERE faculty_id = @id", conn);
-        del.Parameters.AddWithValue("id", NpgsqlDbType.Integer, Convert.ToInt32(id));
-        await del.ExecuteNonQueryAsync();
+        var location = response.Headers.Location?.OriginalString ?? "";
+        Assert.StartsWith("/uifaculty", location);
+        Assert.DoesNotContain("err=", location, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

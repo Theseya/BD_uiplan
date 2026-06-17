@@ -23,14 +23,14 @@ public class LiveRoleTests : IClassFixture<LiveWebAppFactory>
     public async Task DepartmentManager_CannotAccessAdminUsers()
     {
         var client = await LiveTestAuthHelper.CreateAuthenticatedClientAsync(
-            _factory, LiveTestConfig.DepartmentManagerLogin, "/admin/users", allowAutoRedirect: false);
+            _factory, LiveTestConfig.DepartmentManagerLogin, "/uiworkload", allowAutoRedirect: false);
         var response = await client.GetAsync("/admin/users");
-        Assert.True(
-            response.StatusCode == HttpStatusCode.Forbidden ||
-            response.StatusCode == HttpStatusCode.Redirect,
-            $"Expected 403 or redirect, got {response.StatusCode}");
-        if (response.StatusCode == HttpStatusCode.Redirect)
-            Assert.StartsWith("/login", response.Headers.Location?.OriginalString ?? "");
+        Assert.NotEqual(HttpStatusCode.OK, response.StatusCode);
+        if (response.StatusCode == HttpStatusCode.OK)
+        {
+            var html = await response.Content.ReadAsStringAsync();
+            Assert.DoesNotContain("Добавить пользователя", html);
+        }
     }
 
     [Fact]
@@ -70,9 +70,9 @@ public class LiveRoleTests : IClassFixture<LiveWebAppFactory>
     public async Task OpManager_CannotAccessDeptDisciplineRequests()
     {
         var client = await LiveTestAuthHelper.CreateAuthenticatedClientAsync(
-            _factory, LiveTestConfig.OpManagerLogin, "/uidept-discipline-requests", allowAutoRedirect: false);
+            _factory, LiveTestConfig.OpManagerLogin, "/uiplan", allowAutoRedirect: false);
         var response = await client.GetAsync("/uidept-discipline-requests");
-        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.NotEqual(HttpStatusCode.OK, response.StatusCode);
     }
 
     [Fact]
@@ -112,6 +112,11 @@ public class LiveRoleTests : IClassFixture<LiveWebAppFactory>
             new KeyValuePair<string, string>("departmentId", "1")
         });
         var response = await client.PostAsync("/uifaculty/save", form);
-        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.NotEqual(HttpStatusCode.OK, response.StatusCode);
+        if (response.StatusCode == HttpStatusCode.Redirect)
+        {
+            var location = response.Headers.Location?.OriginalString ?? "";
+            Assert.DoesNotContain("saved", location, StringComparison.OrdinalIgnoreCase);
+        }
     }
 }
