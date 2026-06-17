@@ -25,6 +25,8 @@ artifacts/
 *.jfm
 *.pfx
 *.publishsettings
+appsettings.Development.json
+appsettings.Test.json
 
 # User-specific
 *.rsuser

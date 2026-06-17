@@ -4,7 +4,7 @@
 
 ## Запуск
 
-1. **PostgreSQL** — создайте базу и укажите строку подключения в `appsettings.json` (ConnectionStrings:Default).
+1. **PostgreSQL** — создайте базу и укажите строку подключения через локальный `appsettings.Development.json`, `appsettings.Production.json`, user secrets или переменную окружения `ConnectionStrings__Default`.
 2. **Схема БД** — выполните скрипты в таком порядке:
    - `schema.sql` — основные таблицы и представление `v_workload_by_worktype`
    - `add_auth_tables.sql` — пользователи и доступ по ОП/департаментам (или создаются приложением при первом входе)
@@ -68,7 +68,10 @@ dotnet publish -c Release -o ./publish
 
 **3. Настройка на сервере**
 
-В папке с приложением отредактируйте **appsettings.json** (или задайте переменные окружения):
+Не храните пароль к БД в **appsettings.json**. Для локальной разработки скопируйте
+`appsettings.Development.example.json` в `appsettings.Development.json` и укажите свои параметры
+подключения (локальный файл исключён из git). На сервере задавайте переменные окружения или
+отдельный `appsettings.Production.json`, который не попадает в репозиторий.
 
 - **ConnectionStrings:Default** — строка подключения к PostgreSQL на сервере, например:
   - `Host=localhost;Port=5432;Database=workloaddb;Username=ваш_пользователь;Password=пароль`
@@ -81,6 +84,10 @@ dotnet publish -c Release -o ./publish
 - В **Linux** или в systemd:  
   `ASPNETCORE_ENVIRONMENT=Production`
 - В **appsettings.Production.json** (если создадите) можно переопределить только строку подключения, не храня пароль в основном appsettings.
+
+Legacy-ремонт данных при старте (`Database:RunLegacyRepairs=true`) по умолчанию выключен. Включайте
+его только осознанно для старой тестовой БД после резервной копии: он может изменять и удалять
+устаревшие строки справочников/назначений.
 
 **4. Запуск**
 
@@ -106,11 +113,45 @@ dotnet publish -c Release -o ./publish
 
 - В среде Production маршрут `/login/reset-dev` **недоступен** (возвращает 404).
 - Варианты создания первого администратора:
-  - Один раз запустить приложение в **Development** (например, локально с подключением к серверной БД), открыть `/login/reset-dev` — создастся admin/admin; затем сменить пароль в интерфейсе и перевести приложение в Production.
+  - Один раз запустить приложение в **Development** локально с подключением к нужной БД, открыть `/login` и нажать кнопку сброса admin. Сброс выполняется только POST-запросом с CSRF-токеном и только с loopback-клиента.
   - Либо добавить запись в таблицу `app_users` вручную (логин, хеш пароля через AuthHelpers.HashPassword).
 - Остальных пользователей создаёт администратор в разделе «Пользователи».
 
 Кратко: собрали `dotnet publish` → перенесли папку на сервер → настроили БД и строку подключения → выставили Production → запустили как службу или под IIS/nginx.
+
+## Тестирование
+
+### Быстрый запуск
+
+```powershell
+# Unit + mock integration (без PostgreSQL)
+dotnet test WebApplication1.Tests\WebApplication1.Tests.csproj -c Release --filter "FullyQualifiedName!~Live"
+```
+
+### Live-тесты (реальная PostgreSQL)
+
+1. Скопируйте `appsettings.Test.example.json` → `appsettings.Test.json` и укажите пароль.
+2. Создайте изолированную test-БД (клон `workloaddb`):
+
+```powershell
+.\scripts\init-test-db.ps1
+```
+
+3. Запустите live-тесты:
+
+```powershell
+dotnet test WebApplication1.Tests\WebApplication1.Tests.csproj -c Release --filter "FullyQualifiedName~Live"
+```
+
+Live-тесты проверяют: БД, авторизацию, роли (`dep_dm`, `op_bi`), сохранение/импорт ППС, экспорт Excel, workflow согласования.
+
+Переменные окружения (опционально): `WEBAPP_TEST_LOGIN`, `WEBAPP_TEST_PASSWORD`, `ConnectionStrings__Default`.
+
+### Резервная копия БД
+
+```powershell
+.\scripts\backup-db.ps1
+```
 
 ## Роли
 

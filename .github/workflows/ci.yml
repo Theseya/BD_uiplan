@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: WebApplication1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Restore
+        run: dotnet restore WebApplication1.Tests/WebApplication1.Tests.csproj
+      - name: Test (unit + mock integration)
+        run: dotnet test WebApplication1.Tests/WebApplication1.Tests.csproj -c Release --filter "FullyQualifiedName!~Live"
+
+  live-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: WebApplication1
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: workloaddb_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ConnectionStrings__Default: Host=localhost;Port=5432;Database=workloaddb_test;Username=postgres;Password=postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Initialize schema
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d workloaddb_test -v ON_ERROR_STOP=1 -f schema.sql
+          PGPASSWORD=postgres psql -h localhost -U postgres -d workloaddb_test -v ON_ERROR_STOP=1 -f add_auth_tables.sql || true
+          PGPASSWORD=postgres psql -h localhost -U postgres -d workloaddb_test -v ON_ERROR_STOP=1 -f scripts/seed-dep-managers.sql || true
+      - name: Seed CI users
+        run: PGPASSWORD=postgres psql -h localhost -U postgres -d workloaddb_test -v ON_ERROR_STOP=1 -f scripts/test-seed-ci.sql
+      - name: Live tests
+        run: dotnet test WebApplication1.Tests/WebApplication1.Tests.csproj -c Release --filter "FullyQualifiedName~Live"

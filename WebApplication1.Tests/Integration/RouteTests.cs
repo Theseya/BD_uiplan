@@ -129,16 +129,13 @@ public class RouteTests : IClassFixture<WebAppFactory>
     }
 
     [Fact]
-    public async Task Login_ResetDev_Get_InDevelopment_ReturnsRedirectOrServerError()
+    public async Task Login_ResetDev_Get_IsNotAllowed()
     {
         var response = await _client.GetAsync("/login/reset-dev");
-        // Development: 302 when DB works; 500 when DB unavailable
         Assert.True(
-            response.StatusCode == HttpStatusCode.Redirect ||
-            response.StatusCode == HttpStatusCode.InternalServerError,
-            $"Expected Redirect or InternalServerError, got {response.StatusCode}");
-        if (response.StatusCode == HttpStatusCode.Redirect)
-            Assert.Contains("/login", response.Headers.Location?.OriginalString ?? "", StringComparison.OrdinalIgnoreCase);
+            response.StatusCode == HttpStatusCode.MethodNotAllowed ||
+            response.StatusCode == HttpStatusCode.NotFound,
+            $"Expected MethodNotAllowed or NotFound, got {response.StatusCode}");
     }
 
     [Fact]
